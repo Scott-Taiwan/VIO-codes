@@ -1,0 +1,13 @@
+# 1 — install deps (Jetson already has OpenCV, skip that line)
+pip install requests tqdm
+
+# 2 — download tiles (full Taipei ~21 k tiles at z18; use a small area first)
+python download_tiles.py --lat-min 25.03 --lat-max 25.08 \
+                         --lon-min 121.50 --lon-max 121.57
+
+# 3 — build the ORB feature index
+python build_index.py
+
+# 4 — identify a photo
+python localize.py your_photo.jpg
+python localize.py your_photo.jpg --show   # also draws the match on the tile

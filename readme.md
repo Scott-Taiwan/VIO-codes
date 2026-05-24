@@ -90,3 +90,30 @@ false positives when the image source doesn't perfectly match the index.
 
 # Works with multiple images too
 ./build/localize img1.png img2.png --zoom 18
+
+## Git operation
+
+git add .
+git commit -m "Initial commit"
+git push -u origin main
+
+-git account: scott600@mitac.com.tw, using key to access: the key  was generated in the following process:
+
+Step 1: ssh-keygen -t ed25519 -C "scott600@mitac.com.tw"
+Step 2: cat ~/.ssh/id_ed25519.pub
+Step 3: use the output in step 2, open the githup web, login into it
+and in the setting, security page, deploy key page, to click the adding key, type the name and content
+Step 4: test is using shell command:ssh -T git@github.com
+Step  5: configure the user information:
+git config --global user.email "scott600@mitac.com.tw"
+git config --global user.name "scott600"
+Step 6: adding files into it using command: 
+git remote add origin git@github.com:Scott-Taiwan/VIO-codes.git
+Step 7:git add localize.cpp popsift_sift.cpp popsift_sift.h
+...
+Step 8: git commit -m "Add GPS-free visual localization(zoom19, PopSIFT, CUDA)"
+Step 9: git push -u origin main
+Step 10: doing them all at a time
+git add .
+git commit -m "Initial commit"
+git push -u origin main
