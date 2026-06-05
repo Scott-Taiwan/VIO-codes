@@ -1,0 +1,58 @@
+步驟1 下載ESRI 圖像
+python3 download_tiles.py --lat-min 25.04 --lat-max 25.06 
+--lon-min 121.46 --lon-max 121.49 --zoom 19
+
+zoom 18的圖片高度約是100米高  zoom 19的圖片高度約是60米高 我們用zoom 19
+
+步驟2 將下載的圖片檔建立成一個資料庫
+python build_index.py --zoom 19
+
+其實有一個建構檔可以編輯 那是預設值 但是上面的兩個步驟都有送入值，不需要處理這個建構檔
+建構檔名稱是 config.py
+
+步驟 2-1 轉換
+python3 export_index.py --zoom 19
+
+
+步驟3 從衛星圖取共2塊圖像 命名為 ScreenShot_1.png ScreenShot_2.png
+
+步驟4 執行c++地圖比對程式
+./build/localize screenshot_34.png screenshot_33.png --zoom 19
+or 
+python3 localize.py esri_19_439053_224454.png --zoom 19
+
+執行結果如下
+Image: screenshot_33.png
+  Size    : 256×256 px
+  Features: 621 keypoints
+Good matches  : 301 (after ratio test)
+  Top candidates:
+    tile (219522,112216)  votes=300
+    tile (219502,112220)  votes=1
+  [Phase2 SIFT=176ms  Match=6ms  RANSAC=0ms]
+  GPS     : 25.0551231,  121.4682770
+  Inliers : 386  |  tile (219522,112216) z18
+  Maps    : https://maps.google.com/?q=25.0551231,121.4682770
+  Time    : 0.30 s 
+
+  請點擊https link查看準確度 
+
+
+  在上面步驟3，可以直接下載ESRI的一個GPS座標的圖來比對，下載方法是
+  python3 download_tile_at_gps.py 25.05452 121.46801 19
+
+  當我們檢查google map時候可以送入zoom 19 如下
+  https://www.google.com/maps/@25.0426818,121.4737701,19z
+
+
+
+  測試
+  1.先砍掉tiles index目錄底下的檔案
+  2.執行python3 download_tiles.py --lat-min 25.0344 --lat-max 25.0599 --lon-mi
+n 121.4402 --lon-max 121.4920 --zoom 19
+這要很久
+  3. python3 build_index.py --zoom 19
+  4. python3 export_index.py --zoom 19
+  5. python3 download_tile_at_gps.py 25.05452 121.46801 19
+  6. 驗證 ./build/localize screenshot_34.png screenshot_33.png --zoom 19
+     or  python3 localize.py esri_19_439053_224454.png --zoom 19

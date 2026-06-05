@@ -9,7 +9,7 @@ TAIPEI_BBOX = {
 # At Taipei latitude (~25°): zoom 17 ≈ 1.1 m/px, zoom 18 ≈ 0.54 m/px
 # A drone at 30 m covers ~36 m × 27 m → ~33 × 25 px at z17, ~67 × 50 px at z18
 # Use z18 for better matching fidelity; z17 if download size is a concern
-ZOOM_LEVEL = 18
+ZOOM_LEVEL = 19
 TILE_SIZE = 256  # px per tile (standard slippy-map)
 
 TILE_DIR = 'tiles'

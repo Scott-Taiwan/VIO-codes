@@ -41,8 +41,8 @@ python3 download_tile_at_gps.py 25.05452 121.46801 19
 ## check with google map
 
 
-https://www.google.com/maps/@25.0426818,121.4737701,18z
 
+https://www.google.com/maps/@25.0426818,121.4737701,18z
 
 
 
@@ -117,3 +117,13 @@ Step 10: doing them all at a time
 git add .
 git commit -m "Initial commit"
 git push -u origin main
+
+
+# Task 2
+running jetson , when altitude higher than 50 m, start to capture (5 seconds per frame) then search db, finally save the result as file name.
+
+cd /home/scott/claude-project/gpsless_mapping/shot_estimate/
+
+./drone_localize                         # default /dev/ttyTHS1 @ 57600
+./drone_localize --port /dev/ttyUSB0     # USB serial adapter
+./drone_localize --baud 115200 --zoom 18 # custom baud + zoom level

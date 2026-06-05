@@ -1,0 +1,111 @@
+localize.cpp — Flow Chart
+=========================
+
+┌─────────────────────────────────────────────────────────────┐
+│                         main()                              │
+└─────────────────────────────────────────────────────────────┘
+         │
+         ▼
+┌─────────────────────────────────────────────────────────────┐
+│  Parse args: image paths, --show flag, --zoom N (default 18)│
+└─────────────────────────────────────────────────────────────┘
+         │
+         ▼
+┌─────────────────────────────────────────────────────────────┐
+│  ONE-TIME STARTUP                                           │
+│                                                             │
+│  1. Check MemAvailable (/proc/meminfo)                      │
+│       ≥ 512 MB? → try init_popsift() + cuda_knn2_match()    │
+│           success → g_gpu_sift = true  (GPU path)          │
+│           exception → g_gpu_sift = false (CPU fallback)    │
+│       < 512 MB? → g_gpu_sift = false   (CPU fallback)      │
+│                                                             │
+│  2. load_index("index/sift_index_z<N>.bin")                 │
+│       reads N tiles → vector<TileEntry>                     │
+│       each entry: tile_x, tile_y, zoom, descriptors (Nx128) │
+│                                                             │
+│  3. build_flann(index)                                      │
+│       concatenate all tile descriptors → big matrix        │
+│       build KD-tree (5 trees, 50 checks)                   │
+│       record per-tile offsets for reverse lookup           │
+└─────────────────────────────────────────────────────────────┘
+         │
+         ▼
+┌─────────────────────────────────────────────────────────────┐
+│  For each input image → localize_one()                      │
+└─────────────────────────────────────────────────────────────┘
+         │
+         ▼
+┌──────────────────────────────────────────────────────────────┐
+│  localize_one()                                              │
+│                                                              │
+│  1. cv::imread → convert to grayscale                        │
+│                                                              │
+│  2. CPU cv::SIFT (2000 kp) on query image                   │
+│     → kps_q, descs_q                                        │
+│                                                              │
+│  ┌────────────────────────────────────────────────────────┐  │
+│  │  PHASE 1 — Coarse Tile Voting (FLANN)                  │  │
+│  │  flann_vote(descs_q, fi)                               │  │
+│  │   • knnMatch (k=2) query descriptors vs all tiles      │  │
+│  │   • Lowe ratio test (0.75)                             │  │
+│  │   • Binary search offsets → map match to tile index    │  │
+│  │   • Count votes per tile → sort descending             │  │
+│  │   → ranked list of (tile_index, vote_count)            │  │
+│  └────────────────────────────────────────────────────────┘  │
+│                                                              │
+│  Print top 5 candidate tiles                                 │
+│                                                              │
+│  ┌────────────────────────────────────────────────────────┐  │
+│  │  PHASE 2 — Direct Match (top 5 candidates)            │  │
+│  │  For each top candidate tile:                          │  │
+│  │                                                        │  │
+│  │  direct_match()                                        │  │
+│  │   a. stitch_tiles() — load 3×3 tile grid (radius=1)   │  │
+│  │      → 768×768 composite image                         │  │
+│  │                                                        │  │
+│  │   b. detect_compute() on composite + query             │  │
+│  │      GPU: popsift_detect_compute() (PopSIFT)           │  │
+│  │      CPU: cv::SIFT::create()                           │  │
+│  │                                                        │  │
+│  │   c. knnMatch (k=2) descriptors                        │  │
+│  │      GPU: cuda_knn2_match() (cuBLAS BF)                │  │
+│  │      CPU: cv::BFMatcher (NORM_L2)                      │  │
+│  │                                                        │  │
+│  │   d. Lowe ratio test → good matches                    │  │
+│  │                                                        │  │
+│  │   e. RANSAC homography (threshold=5px)                 │  │
+│  │      → inlier count ≥ MIN_INLIERS (15)?                │  │
+│  │          NO  → try next candidate                      │  │
+│  │          YES → continue                                │  │
+│  │                                                        │  │
+│  │   f. perspectiveTransform(query centre → composite)    │  │
+│  │      → pixel (cpx, cpy) in composite space             │  │
+│  │                                                        │  │
+│  │   g. pixel_to_latlon(cpx, cpy, tile_x, tile_y, zoom)  │  │
+│  │      → (lat, lon)                                      │  │
+│  └────────────────────────────────────────────────────────┘  │
+│                                                              │
+│  All candidates failed?                                      │
+│    → "Could not determine location."                         │
+│                                                              │
+│  Success?                                                    │
+│    → Print GPS coords, inliers, Google Maps URL, time        │
+│    → if --show: draw query outline on composite,             │
+│                 save result_tile_<name>.png                  │
+│                 save result_query_<name>.png                 │
+└──────────────────────────────────────────────────────────────┘
+         │
+         ▼
+┌─────────────────────────────────────────────────────────────┐
+│  Print total time for all images                            │
+│  shutdown_popsift()                                         │
+└─────────────────────────────────────────────────────────────┘
+
+
+Key Design Points
+-----------------
+- Startup is expensive (FLANN KD-tree build) but done once — suitable for pre-takeoff initialization
+- Phase 1 is fast (KD-tree already built), narrows thousands of tiles down to 5 candidates
+- Phase 2 is precise — SIFT + RANSAC homography on a 3×3 stitched tile patch gives sub-pixel GPS accuracy
+- GPU/CPU path is selected at runtime based on available RAM; same logic applies to both SIFT extraction and descriptor matching
