@@ -255,13 +255,18 @@ static std::optional<MatchResult> direct_match(
 // ── filename ──────────────────────────────────────────────────────────────────
 
 static std::string build_filename(double rlat, double rlon,
-                                   double elat, double elon, bool ok)
+                                   double elat, double elon,
+                                   bool ok, double dist_m = -1.0)
 {
     std::ostringstream ss;
     ss << std::fixed << std::setprecision(7);
     ss << rlat << "_" << rlon << "-";
-    if (ok) ss << elat << "_" << elon;
-    else    ss << "NOFIX_NOFIX";
+    if (ok) {
+        ss << elat << "_" << elon;
+        ss << "__" << std::setprecision(1) << dist_m << "m";
+    } else {
+        ss << "NOFIX_NOFIX__NAm";
+    }
     ss << ".png";
     return ss.str();
 }
@@ -438,7 +443,7 @@ int main(int argc, char* argv[])
         if (descs_q.empty() || (int)kps_q.size() < 5) {
             log("Too few features — NOFIX", "!!!");
             std::string fname = build_filename(real_lat, real_lon, 0, 0, false);
-            cv::imwrite(std::string(PHOTO_DIR)+"/"+fname, frame);
+            cv::imwrite(std::string(PHOTO_DIR) + "/" + fname, frame);
             log("Saved: " + fname, "SAV");
             continue;
         }
@@ -494,11 +499,11 @@ int main(int argc, char* argv[])
         // ── result ────────────────────────────────────────────────────────
         std::cout << "\n";
         bool has_fix = result.has_value();
-        double est_lat = 0, est_lon = 0;
+        double est_lat = 0, est_lon = 0, dist_m = -1.0;
         if (has_fix) {
             est_lat = result->lat;
             est_lon = result->lon;
-            double err = haversine_m(real_lat, real_lon, est_lat, est_lon);
+            dist_m  = haversine_m(real_lat, real_lon, est_lat, est_lon);
 
             std::ostringstream res_msg;
             res_msg << std::fixed << std::setprecision(7)
@@ -506,15 +511,15 @@ int main(int argc, char* argv[])
             log(res_msg.str(), "GPS");
             std::ostringstream err_msg;
             err_msg << "RANSAC inliers: " << result->inliers
-                    << "   Error from real GPS: "
-                    << std::fixed << std::setprecision(1) << err << " m";
+                    << "   Distance from real GPS: "
+                    << std::fixed << std::setprecision(1) << dist_m << " m";
             log(err_msg.str(), "GPS");
         } else {
             log("Est. GPS  : NOFIX (no tile matched)", "!!!");
         }
 
         std::string fname = build_filename(real_lat, real_lon,
-                                            est_lat, est_lon, has_fix);
+                                            est_lat, est_lon, has_fix, dist_m);
         std::string fpath = std::string(PHOTO_DIR) + "/" + fname;
         cv::imwrite(fpath, frame);
         log("Saved     : " + fpath, "SAV");

@@ -37,6 +37,7 @@
 #include <cmath>
 #include <csignal>
 #include <cstring>
+
 #include <fcntl.h>
 #include <filesystem>
 #include <fstream>
@@ -65,6 +66,10 @@ static const char*  PHOTO_DIR         = "photo_obtained";
 static const double TAKEOFF_ALT       = 50.0;   // m  — start capturing above this
 static const double MIN_CAPTURE_ALT   = 10.0;   // m  — pause below this (landing)
 static const double CAPTURE_INTERVAL  = 5.0;    // s  — between frames
+
+// ── drift-prevention parameters ───────────────────────────────────────────────
+static const int    MIN_INLIERS_SEND      = 10;    // below this RANSAC geometry is useless
+static const double MIN_WAYPOINT_SPACING  = 300.0; // m — warn if waypoints closer (#4)
 
 static const int    TILE_SIZE         = 256;
 static const float  MATCH_RATIO       = 0.75f;
@@ -107,6 +112,203 @@ static double haversine_m(double lat1, double lon1, double lat2, double lon2)
     double a = std::sin(dphi/2)*std::sin(dphi/2)
              + std::cos(phi1)*std::cos(phi2)*std::sin(dlam/2)*std::sin(dlam/2);
     return 2.0 * R * std::asin(std::sqrt(a));
+}
+
+// ── drift-prevention helpers ──────────────────────────────────────────────────
+
+// Map RANSAC inlier count → horizontal accuracy (metres) for GPS_INPUT.
+// Pixhawk EKF blends this fix with IMU proportional to hacc —
+// high hacc = IMU does most of the work; low hacc = fix is trusted strongly.
+static float hacc_from_inliers(int inliers)
+{
+    if (inliers > 80) return  10.0f;  // strong match  — trust fix
+    if (inliers >= 40) return 30.0f;  // good match
+    if (inliers >= 20) return 60.0f;  // weak match    — IMU does most work
+    return                  100.0f;   // 10–19 inliers — IMU almost entirely
+}
+
+// Send GPS_INPUT MAVLink message to Pixhawk so it can use SIFT position.
+// ignore_flags = 191: ignore alt(1)|hdop(2)|vdop(4)|vel_h(8)|vel_v(16)|
+//                          speed_acc(32)|vert_acc(128)
+// We DO send horiz_accuracy (bit 64 NOT set in ignore mask).
+static void send_gps_input(int fd, double lat, double lon, float hacc)
+{
+    mavlink_message_t msg;
+    uint8_t buf[MAVLINK_MAX_PACKET_LEN];
+
+    mavlink_msg_gps_input_pack(
+        1, 200, &msg,
+        0,                          // time_usec (0 = autopilot uses own clock)
+        0,                          // gps_id
+        191,                        // ignore_flags (see above)
+        0, 0,                       // time_week_ms, time_week (ignored)
+        3,                          // fix_type: 3D fix
+        (int32_t)(lat * 1e7),       // lat degE7
+        (int32_t)(lon * 1e7),       // lon degE7
+        0.0f,                       // alt (ignored)
+        1.0f, 1.0f,                 // hdop, vdop (ignored)
+        0.0f, 0.0f, 0.0f,          // vn, ve, vd (ignored)
+        0.0f,                       // speed_accuracy (ignored)
+        hacc,                       // horiz_accuracy — key trust field
+        5.0f,                       // vert_accuracy (ignored)
+        10,                         // satellites_visible (plausible value)
+        0                           // yaw: 0 = unknown
+    );
+
+    uint16_t len = mavlink_msg_to_send_buffer(buf, &msg);
+    ::write(fd, buf, len);
+}
+
+// ── #4: waypoint spacing validation ──────────────────────────────────────────
+
+struct Waypoint { double lat, lon; };
+
+static std::vector<Waypoint> parse_waypoints(const std::string& s)
+{
+    // Format: "lat1,lon1 lat2,lon2 lat3,lon3"
+    std::vector<Waypoint> wps;
+    std::istringstream iss(s);
+    std::string token;
+    while (iss >> token) {
+        auto comma = token.find(',');
+        if (comma == std::string::npos)
+            throw std::runtime_error(
+                "Waypoint format error: expected lat,lon  e.g. 25.061,121.471");
+        wps.push_back({std::stod(token.substr(0, comma)),
+                       std::stod(token.substr(comma + 1))});
+    }
+    return wps;
+}
+
+static void validate_waypoints(const std::vector<Waypoint>& wps)
+{
+    if (wps.empty()) return;
+    std::cout << "\n[#4] Waypoint spacing check (" << wps.size() << " waypoints):\n";
+    bool all_ok = true;
+    for (size_t i = 1; i < wps.size(); ++i) {
+        double d = haversine_m(wps[i-1].lat, wps[i-1].lon, wps[i].lat, wps[i].lon);
+        bool ok  = d >= MIN_WAYPOINT_SPACING;
+        if (!ok) all_ok = false;
+        std::cout << "  WP" << i << " → WP" << (i+1) << " : "
+                  << std::fixed << std::setprecision(1) << d << " m  "
+                  << (ok ? "OK" : "WARNING — too close, bearing error risk") << "\n";
+    }
+    if (!all_ok)
+        std::cout << "  *** Keep waypoints >= " << MIN_WAYPOINT_SPACING
+                  << " m apart to avoid large bearing errors near target. ***\n";
+    std::cout << "  Final target (WP" << wps.size() << "): "
+              << std::setprecision(7) << wps.back().lat
+              << ", " << wps.back().lon << "\n\n";
+}
+
+
+// ── mission fetch from Pixhawk ────────────────────────────────────────────────
+
+// Block until one HEARTBEAT is received from Pixhawk.
+static void wait_for_heartbeat(int fd)
+{
+    std::cout << "Waiting for Pixhawk heartbeat …" << std::flush;
+    mavlink_message_t msg;
+    mavlink_status_t  status;
+    uint8_t byte;
+    while (!g_shutdown) {
+        ssize_t n = ::read(fd, &byte, 1);
+        if (n > 0 && mavlink_parse_char(MAVLINK_COMM_0, byte, &msg, &status))
+            if (msg.msgid == MAVLINK_MSG_ID_HEARTBEAT) { std::cout << " ok.\n"; return; }
+    }
+}
+
+// Download the active mission from Pixhawk using the MAVLink mission protocol.
+// Returns MAV_CMD_NAV_WAYPOINT items only; item 0 (home) is always skipped.
+// Returns an empty vector on timeout or if no mission is loaded.
+static std::vector<Waypoint> fetch_mission_from_pixhawk(int fd)
+{
+    auto send_raw = [&](mavlink_message_t& m) {
+        uint8_t buf[MAVLINK_MAX_PACKET_LEN];
+        uint16_t len = mavlink_msg_to_send_buffer(buf, &m);
+        ::write(fd, buf, len);
+    };
+
+    mavlink_message_t msg, req;
+    mavlink_status_t  status;
+    uint8_t byte;
+
+    // Step 1 — request mission list
+    mavlink_msg_mission_request_list_pack(1, 200, &req, 1, 1,
+                                          MAV_MISSION_TYPE_MISSION);
+    send_raw(req);
+    std::cout << "[mission] Requesting mission …" << std::flush;
+
+    // Step 2 — wait for MISSION_COUNT
+    int count = 0;
+    {
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        bool got = false;
+        while (!g_shutdown && std::chrono::steady_clock::now() < deadline) {
+            ssize_t n = ::read(fd, &byte, 1);
+            if (n > 0 && mavlink_parse_char(MAVLINK_COMM_0, byte, &msg, &status)) {
+                if (msg.msgid == MAVLINK_MSG_ID_MISSION_COUNT) {
+                    mavlink_mission_count_t mc;
+                    mavlink_msg_mission_count_decode(&msg, &mc);
+                    count = mc.count;
+                    got = true;
+                    break;
+                }
+            }
+        }
+        if (!got) { std::cout << " timeout (no mission loaded).\n"; return {}; }
+    }
+    std::cout << " " << count << " item(s).\n";
+    if (count == 0) return {};
+
+    // Step 3 — request each item individually
+    std::vector<Waypoint> wps;
+    for (int i = 0; i < count && !g_shutdown; ++i) {
+        mavlink_msg_mission_request_int_pack(1, 200, &req, 1, 1,
+                                             (uint16_t)i, MAV_MISSION_TYPE_MISSION);
+        send_raw(req);
+
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        bool got = false;
+        while (!g_shutdown && std::chrono::steady_clock::now() < deadline) {
+            ssize_t n = ::read(fd, &byte, 1);
+            if (n > 0 && mavlink_parse_char(MAVLINK_COMM_0, byte, &msg, &status)) {
+                if (msg.msgid == MAVLINK_MSG_ID_MISSION_ITEM_INT) {
+                    mavlink_mission_item_int_t item;
+                    mavlink_msg_mission_item_int_decode(&msg, &item);
+                    if (item.seq == (uint16_t)i) {
+                        // item 0 is the home position — skip it
+                        if (i > 0 && item.command == MAV_CMD_NAV_WAYPOINT
+                                   && item.x != 0 && item.y != 0) {
+                            double lat = item.x / 1e7;
+                            double lon = item.y / 1e7;
+                            std::cout << "  WP" << i << ": ("
+                                      << std::fixed << std::setprecision(7)
+                                      << lat << ", " << lon << ")\n";
+                            wps.push_back({lat, lon});
+                        } else {
+                            std::cout << "  item" << i << ": cmd=" << item.command
+                                      << " (skipped)\n";
+                        }
+                        got = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if (!got) {
+            std::cerr << "  Timeout waiting for item " << i << " — aborting.\n";
+            return {};
+        }
+    }
+
+    // Step 4 — acknowledge receipt
+    mavlink_msg_mission_ack_pack(1, 200, &req, 1, 1,
+                                  MAV_MISSION_ACCEPTED, MAV_MISSION_TYPE_MISSION);
+    send_raw(req);
+
+    std::cout << "[mission] " << wps.size() << " navigation waypoint(s) loaded.\n";
+    return wps;
 }
 
 // ── tile index ────────────────────────────────────────────────────────────────
@@ -412,15 +614,18 @@ static std::string gst_pipeline(int sensor_id, int w, int h, int fps, int flip)
 // ── photo filename ────────────────────────────────────────────────────────────
 
 static std::string build_filename(double real_lat, double real_lon,
-                                   double est_lat,  double est_lon, bool has_fix)
+                                   double est_lat,  double est_lon,
+                                   bool has_fix, double dist_m = -1.0)
 {
     std::ostringstream ss;
     ss << std::fixed << std::setprecision(7);
     ss << real_lat << "_" << real_lon << "-";
-    if (has_fix)
+    if (has_fix) {
         ss << est_lat << "_" << est_lon;
-    else
-        ss << "NOFIX_NOFIX";
+        ss << "__" << std::setprecision(1) << dist_m << "m";
+    } else {
+        ss << "NOFIX_NOFIX__NAm";
+    }
     ss << ".png";
     return ss.str();
 }
@@ -475,14 +680,19 @@ int main(int argc, char* argv[])
     const char* port = DEFAULT_PORT;
     int         baud = DEFAULT_BAUD;
     int         zoom = DEFAULT_ZOOM;
+    std::string waypoints_str;   // #4 & #5
 
     for (int i = 1; i < argc; ++i) {
-        if (!strcmp(argv[i], "--port") && i+1 < argc) port = argv[++i];
-        else if (!strcmp(argv[i], "--baud") && i+1 < argc) baud = std::stoi(argv[++i]);
-        else if (!strcmp(argv[i], "--zoom") && i+1 < argc) zoom = std::stoi(argv[++i]);
+        if      (!strcmp(argv[i], "--port")      && i+1 < argc) port = argv[++i];
+        else if (!strcmp(argv[i], "--baud")      && i+1 < argc) baud = std::stoi(argv[++i]);
+        else if (!strcmp(argv[i], "--zoom")      && i+1 < argc) zoom = std::stoi(argv[++i]);
+        else if (!strcmp(argv[i], "--waypoints") && i+1 < argc) waypoints_str = argv[++i];
         else {
             std::cerr << "Usage: " << argv[0]
-                      << " [--port /dev/ttyTHS1] [--baud 57600] [--zoom 18]\n";
+                      << " [--port /dev/ttyTHS1] [--baud 57600] [--zoom 18]\n"
+                      << "       [--waypoints \"lat1,lon1 lat2,lon2 ...\"]\n"
+                      << "  Mission waypoints are auto-fetched from Pixhawk at startup.\n"
+                      << "  --waypoints overrides the auto-fetch.\n";
             return 1;
         }
     }
@@ -494,6 +704,18 @@ int main(int argc, char* argv[])
     // ── create photo output directory ─────────────────────────────────────────
     fs::create_directories(PHOTO_DIR);
     std::cout << "Photos → " << fs::absolute(PHOTO_DIR) << "\n";
+
+    // ── #4: parse + validate waypoints ────────────────────────────────────────
+    std::vector<Waypoint> waypoints;
+    if (!waypoints_str.empty()) {
+        try {
+            waypoints = parse_waypoints(waypoints_str);
+            validate_waypoints(waypoints);
+        } catch (const std::exception& e) {
+            std::cerr << "ERROR: " << e.what() << "\n";
+            return 1;
+        }
+    }
 
     // ── GPU init (optional) ───────────────────────────────────────────────────
 #ifdef USE_GPU
@@ -541,7 +763,7 @@ int main(int argc, char* argv[])
     std::cout << index.size() << " tiles.\n";
     FlannIndex fi = build_flann(index);
 
-    // ── open serial + start MAVLink reader ────────────────────────────────────
+    // ── open serial ───────────────────────────────────────────────────────────
     std::cout << "MAVLink serial : " << port << " @ " << baud << " baud … " << std::flush;
     int serial_fd;
     try {
@@ -552,6 +774,19 @@ int main(int argc, char* argv[])
     }
     std::cout << "ok.\n";
 
+    // ── heartbeat + auto-fetch mission (before starting reader thread) ────────
+    wait_for_heartbeat(serial_fd);
+    if (waypoints.empty()) {
+        // No --waypoints override: read the active mission from Pixhawk
+        waypoints = fetch_mission_from_pixhawk(serial_fd);
+        if (!waypoints.empty())
+            validate_waypoints(waypoints);
+    } else {
+        std::cout << "[mission] Using --waypoints override ("
+                  << waypoints.size() << " point(s)).\n";
+    }
+
+    // ── start MAVLink reader thread ───────────────────────────────────────────
     VehicleState state;
     std::thread mav_thread(mavlink_reader, serial_fd, std::ref(state));
 
@@ -639,21 +874,38 @@ int main(int argc, char* argv[])
             auto result = localize_frame(frame, index, fi, zoom);
 
             bool has_fix = result.has_value();
-            double est_lat = 0, est_lon = 0;
+            double est_lat = 0, est_lon = 0, dist_m = -1.0;
             if (has_fix) {
                 est_lat = result->lat;
                 est_lon = result->lon;
-                double err = haversine_m(real_lat, real_lon, est_lat, est_lon);
-                std::cout << "  Est. GPS : " << est_lat << ", " << est_lon << "\n";
+                dist_m  = haversine_m(real_lat, real_lon, est_lat, est_lon);
+                std::cout << "  Est. GPS : " << std::setprecision(7)
+                          << est_lat << ", " << est_lon << "\n";
                 std::cout << "  Inliers  : " << result->inliers
-                          << "   Error: " << std::setprecision(1) << err << " m\n";
+                          << "   Distance: " << std::setprecision(1) << dist_m << " m\n";
             } else {
                 std::cout << "  Est. GPS : NOFIX\n";
             }
 
+            // ── send fix to Pixhawk (hacc expresses confidence to EKF) ──────
+            if (has_fix && result->inliers >= MIN_INLIERS_SEND) {
+                float hacc = hacc_from_inliers(result->inliers);
+                std::cout << "  → GPS_INPUT: ("
+                          << std::setprecision(7) << est_lat << ", " << est_lon << ")"
+                          << "  inliers=" << result->inliers
+                          << "  hacc=" << std::setprecision(1) << hacc << " m\n";
+                send_gps_input(serial_fd, est_lat, est_lon, hacc);
+            } else if (has_fix) {
+                std::cout << "  → inliers=" << result->inliers
+                          << " < " << MIN_INLIERS_SEND
+                          << " — geometry unreliable, not sent; Pixhawk uses IMU\n";
+            } else {
+                std::cout << "  → NOFIX — not sent; Pixhawk uses IMU\n";
+            }
+
             // save photo
             std::string fname = build_filename(real_lat, real_lon,
-                                               est_lat, est_lon, has_fix);
+                                               est_lat, est_lon, has_fix, dist_m);
             std::string fpath = std::string(PHOTO_DIR) + "/" + fname;
             cv::imwrite(fpath, frame);
             std::cout << "  Saved    : " << fpath << "\n";

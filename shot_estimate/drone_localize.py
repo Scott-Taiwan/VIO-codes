@@ -45,6 +45,10 @@ TAKEOFF_ALT      = 50.0   # m  — begin capturing once above this
 MIN_CAPTURE_ALT  = 10.0   # m  — pause if drone descends below this (landing)
 CAPTURE_INTERVAL = 5.0    # s  — time between photos
 
+# ── drift-prevention parameters ───────────────────────────────────────────────
+MIN_INLIERS_SEND     = 10     # below this RANSAC geometry is useless
+MIN_WAYPOINT_SPACING = 300.0  # m — warn if waypoints closer than this (#4)
+
 PHOTO_DIR = Path(__file__).parent / 'photo_obtained'
 
 # CSI camera
@@ -208,24 +212,161 @@ class SiftLocalizer:
             if out is not None:
                 lat, lon, inliers, *_ = out
                 log.info(f'  Match! inliers={inliers}  est=({lat:.7f}, {lon:.7f})')
-                return lat, lon
+                return lat, lon, inliers
 
         log.warning('  No match found in any candidate tile.')
         return None
 
 
+# ── drift-prevention helpers ──────────────────────────────────────────────────
+
+def hacc_from_inliers(inliers):
+    """
+    Map RANSAC inlier count to horiz_accuracy (metres) for GPS_INPUT.
+    Pixhawk EKF blends fix with IMU proportional to hacc —
+    high hacc = IMU does most work; low hacc = fix is trusted strongly.
+    """
+    if inliers > 80:  return  10.0   # strong match  — trust fix
+    if inliers >= 40: return  30.0   # good match
+    if inliers >= 20: return  60.0   # weak match    — IMU does most work
+    return                   100.0   # 10–19 inliers — IMU almost entirely
+
+
+def send_gps_input(conn, lat, lon, hacc):
+    """
+    Send GPS_INPUT MAVLink message to Pixhawk.
+    ignore_flags = 191: ignore alt|hdop|vdop|vel_h|vel_v|speed_acc|vert_acc.
+    horiz_accuracy IS sent — this is the key trust field Pixhawk uses.
+    """
+    # 1+2+4+8+16+32+128 = 191 (ignore everything except horiz_accuracy)
+    ignore_flags = 191
+    conn.mav.gps_input_send(
+        0,                    # time_usec (0 = autopilot uses own clock)
+        0,                    # gps_id
+        ignore_flags,
+        0,                    # time_week_ms (ignored)
+        0,                    # time_week   (ignored)
+        3,                    # fix_type: 3D fix
+        int(lat * 1e7),       # lat degE7
+        int(lon * 1e7),       # lon degE7
+        0.0,                  # alt (ignored)
+        1.0,                  # hdop (ignored)
+        1.0,                  # vdop (ignored)
+        0.0, 0.0, 0.0,        # vn, ve, vd (ignored)
+        0.0,                  # speed_accuracy (ignored)
+        hacc,                 # horiz_accuracy — key field
+        5.0,                  # vert_accuracy  (ignored)
+        10                    # satellites_visible
+    )
+
+
+# ── mission fetch from Pixhawk ────────────────────────────────────────────────
+
+def fetch_mission_from_pixhawk(conn):
+    """
+    Download the active mission from Pixhawk using MAVLink mission protocol.
+    Returns a list of Waypoint for MAV_CMD_NAV_WAYPOINT (cmd=16) items.
+    Item 0 (home position) is always skipped.
+    Returns [] on timeout or if no mission is loaded.
+    """
+    log.info('[mission] Requesting mission from Pixhawk …')
+
+    # Step 1: request list
+    conn.mav.mission_request_list_send(
+        conn.target_system, conn.target_component,
+        0)  # mission_type = MAV_MISSION_TYPE_MISSION
+
+    # Step 2: wait for MISSION_COUNT
+    msg = conn.recv_match(type='MISSION_COUNT', blocking=True, timeout=10)
+    if msg is None:
+        log.warning('[mission] Timeout — no mission loaded in Pixhawk.')
+        return []
+    count = msg.count
+    log.info(f'[mission] {count} item(s).')
+    if count == 0:
+        return []
+
+    # Step 3: request each item
+    wps = []
+    for i in range(count):
+        conn.mav.mission_request_int_send(
+            conn.target_system, conn.target_component,
+            i, 0)  # seq, mission_type
+
+        item = conn.recv_match(type='MISSION_ITEM_INT', blocking=True, timeout=5)
+        if item is None:
+            log.error(f'[mission] Timeout waiting for item {i} — aborting.')
+            return []
+        if item.seq != i:
+            log.error(f'[mission] Got item seq={item.seq}, expected {i} — aborting.')
+            return []
+
+        # item 0 is the home position; only keep NAV_WAYPOINT (cmd=16)
+        if i > 0 and item.command == 16 and item.x != 0 and item.y != 0:
+            lat = item.x / 1e7
+            lon = item.y / 1e7
+            log.info(f'  WP{i}: ({lat:.7f}, {lon:.7f})')
+            wps.append(Waypoint(lat, lon))
+        else:
+            log.info(f'  item{i}: cmd={item.command} (skipped)')
+
+    # Step 4: acknowledge
+    conn.mav.mission_ack_send(
+        conn.target_system, conn.target_component,
+        0, 0)  # type=MAV_MISSION_ACCEPTED, mission_type=MAV_MISSION_TYPE_MISSION
+
+    log.info(f'[mission] {len(wps)} navigation waypoint(s) loaded.')
+    return wps
+
+
+# ── waypoint helpers (#4 and #5) ─────────────────────────────────────────────
+
+class Waypoint:
+    def __init__(self, lat, lon):
+        self.lat = lat
+        self.lon = lon
+
+
+def parse_waypoints(s):
+    """Parse 'lat1,lon1 lat2,lon2 ...' string into list of Waypoint."""
+    wps = []
+    for token in s.strip().split():
+        parts = token.split(',')
+        if len(parts) != 2:
+            raise ValueError(f"Bad waypoint token '{token}' — expected lat,lon")
+        wps.append(Waypoint(float(parts[0]), float(parts[1])))
+    return wps
+
+
+def validate_waypoints(wps):
+    """Warn (#4) if consecutive waypoints are closer than MIN_WAYPOINT_SPACING."""
+    if len(wps) < 2:
+        return
+    for i in range(1, len(wps)):
+        d = _haversine_m(wps[i-1].lat, wps[i-1].lon, wps[i].lat, wps[i].lon)
+        if d < MIN_WAYPOINT_SPACING:
+            log.warning(
+                f'Waypoint spacing warning (#4): WP{i-1}→WP{i} is only {d:.0f} m '
+                f'(minimum recommended: {MIN_WAYPOINT_SPACING:.0f} m). '
+                f'SIFT accuracy (~50 m) may be insufficient for close waypoints.'
+            )
+
+
+
 # ── filename helper ───────────────────────────────────────────────────────────
 
-def build_filename(real_lat, real_lon, est_lat, est_lon):
+def build_filename(real_lat, real_lon, est_lat, est_lon, dist_m=None):
     """
-    Format: {lat_real}_{lon_real}-{lat_est}_{lon_est}.png
-    Example: 25.0523400_121.4623100-25.0523012_121.4622875.png
+    Format: {lat_real}_{lon_real}-{lat_est}_{lon_est}__{meters}m.png
+    Example: 25.0523400_121.4623100-25.0523012_121.4622875__28.3m.png
+    No fix:  25.0523400_121.4623100-NOFIX_NOFIX__NAm.png
     """
     real_part = f'{real_lat:.7f}_{real_lon:.7f}'
     if est_lat is not None and est_lon is not None:
-        est_part = f'{est_lat:.7f}_{est_lon:.7f}'
+        dist_str = f'{dist_m:.1f}' if dist_m is not None else 'NA'
+        est_part = f'{est_lat:.7f}_{est_lon:.7f}__{dist_str}m'
     else:
-        est_part = 'NOFIX_NOFIX'
+        est_part = 'NOFIX_NOFIX__NAm'
     return f'{real_part}-{est_part}.png'
 
 
@@ -239,16 +380,35 @@ def main():
                         help='Baud rate (default: 57600)')
     parser.add_argument('--zoom',  type=int, default=ZOOM_LEVEL,
                         help=f'Map tile zoom level (default: {ZOOM_LEVEL})')
+    parser.add_argument('--waypoints', default='',
+                        help='Override: space-separated "lat,lon" waypoints (last = target). '
+                             'If omitted, waypoints are auto-fetched from the Pixhawk mission.')
     args = parser.parse_args()
 
     PHOTO_DIR.mkdir(parents=True, exist_ok=True)
     log.info(f'Photos will be saved to: {PHOTO_DIR.resolve()}')
+
+    # ── parse and validate waypoints (#4) ────────────────────────────────────
+    waypoints = []
+    if args.waypoints:
+        waypoints = parse_waypoints(args.waypoints)
+        log.info(f'Waypoints loaded: {len(waypoints)} point(s)')
+        validate_waypoints(waypoints)   # logs warnings for spacing < 300 m
+        log.info(f'Target waypoint: ({waypoints[-1].lat}, {waypoints[-1].lon})')
 
     # ── connect to Pixhawk ────────────────────────────────────────────────────
     log.info(f'Connecting to Pixhawk on {args.port} @ {args.baud} baud …')
     conn = mavutil.mavlink_connection(args.port, baud=args.baud)
     conn.wait_heartbeat()
     log.info(f'Heartbeat OK — system={conn.target_system} component={conn.target_component}')
+
+    # ── auto-fetch mission from Pixhawk (before starting reader thread) ───────
+    if not waypoints:
+        waypoints = fetch_mission_from_pixhawk(conn)
+        if waypoints:
+            validate_waypoints(waypoints)
+    else:
+        log.info(f'[mission] Using --waypoints override ({len(waypoints)} point(s)).')
 
     state   = VehicleState()
     stop_ev = threading.Event()
@@ -265,7 +425,6 @@ def main():
     was_on_ground    = True
     capturing_active = False
     last_capture_t   = 0.0
-
     log.info(f'Waiting for takeoff … (trigger altitude ≥ {TAKEOFF_ALT} m)')
 
     try:
@@ -310,15 +469,28 @@ def main():
                 # Estimate location via SIFT tile matching
                 est = localizer.localize(frame)
                 if est is not None:
-                    est_lat, est_lon = est
+                    est_lat, est_lon, inliers = est
+                    dist_m = _haversine_m(real_lat, real_lon, est_lat, est_lon)
                     log.info(f'  Est. GPS : {est_lat:.7f}, {est_lon:.7f}')
-                    err_m = _haversine_m(real_lat, real_lon, est_lat, est_lon)
-                    log.info(f'  Error    : {err_m:.1f} m')
+                    log.info(f'  Inliers  : {inliers}   Distance: {dist_m:.1f} m')
                 else:
-                    est_lat = est_lon = None
+                    est_lat = est_lon = dist_m = None
+                    inliers = 0
+
+                # ── send fix to Pixhawk (hacc expresses confidence to EKF) ───
+                if est is not None and inliers >= MIN_INLIERS_SEND:
+                    hacc = hacc_from_inliers(inliers)
+                    log.info(f'  → GPS_INPUT: ({est_lat:.7f}, {est_lon:.7f})'
+                             f'  inliers={inliers}  hacc={hacc:.0f} m')
+                    send_gps_input(conn, est_lat, est_lon, hacc)
+                elif est is not None:
+                    log.warning(f'  → inliers={inliers} < {MIN_INLIERS_SEND}'
+                                f' — geometry unreliable, not sent; Pixhawk uses IMU')
+                else:
+                    log.warning('  → NOFIX — not sent; Pixhawk uses IMU')
 
                 # Save photo with GPS info in filename
-                fname   = build_filename(real_lat, real_lon, est_lat, est_lon)
+                fname   = build_filename(real_lat, real_lon, est_lat, est_lon, dist_m)
                 outpath = PHOTO_DIR / fname
                 cv2.imwrite(str(outpath), frame)
                 log.info(f'  Saved    : {fname}')
