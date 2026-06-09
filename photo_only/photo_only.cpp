@@ -57,7 +57,7 @@ namespace fs = std::filesystem;
 
 static const char*  DEFAULT_PORT     = "/dev/ttyTHS1";
 static const int    DEFAULT_BAUD     = 57600;
-static const int    DEFAULT_ZOOM     = 18;
+static const int    DEFAULT_ZOOM     = 19;
 static const char*  INDEX_DIR        = "../index";
 static const char*  TILE_DIR         = "../tiles";
 static const char*  RESULT_DIR       = "result";
