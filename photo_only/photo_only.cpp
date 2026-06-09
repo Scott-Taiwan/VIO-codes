@@ -229,8 +229,8 @@ static std::optional<MatchResult> direct_match(
     auto sift = cv::SIFT::create(3000);
     std::vector<cv::KeyPoint> kps_c, kps_q;
     cv::Mat descs_c, descs_q_local;
-    sift->detectAndCompute(comp_gray,  kps_c, descs_c,       cv::noArray());
-    sift->detectAndCompute(query_gray, kps_q, descs_q_local, cv::noArray());
+    sift->detectAndCompute(comp_gray,  cv::noArray(), kps_c,       descs_c);
+    sift->detectAndCompute(query_gray, cv::noArray(), kps_q, descs_q_local);
 
     if (descs_c.empty() || (int)kps_c.size() < min_inliers) return std::nullopt;
     if (descs_q_local.empty() || (int)kps_q.size() < min_inliers) return std::nullopt;
