@@ -1,24 +1,24 @@
 /*
- * best_altitude.cpp — Autonomous altitude-optimization survey
+ * best_altitude.cpp — Autonomous (position × altitude) SIFT accuracy survey
  *
- * Commands Pixhawk (ArduCopter GUIDED mode) to:
- *   1. Arm and take off
- *   2. Visit 5 test points at increasing altitudes (20–60 m),
- *      each at a different position within 50 m of home
- *   3. At each point: capture photo, run SIFT, record GPS error
- *   4. RTL at 110 s (leaves 10 s headroom before the 2-minute deadline)
- *   5. Print best altitude (lowest mean SIFT error)
+ * For each of 5 horizontal positions within 30 m of home, climbs through
+ * 5 altitude levels (20→30→40→50→60 m), taking a photo and running SIFT
+ * at each step.  Up to 25 test shots total; time budget checked at every
+ * step — any tests not reached are marked "--" in the result table.
  *
- * Test pattern:
- *   Point 0:  20 m alt,   0 m N,   0 m E  (above home)
- *   Point 1:  30 m alt,  20 m N,   0 m E
- *   Point 2:  40 m alt,   0 m N,  20 m E
- *   Point 3:  50 m alt,  20 m S,   0 m E
- *   Point 4:  60 m alt,   0 m N,  20 m W
+ * Flight path:
+ *   ① Arm + takeoff → home @ 20 m
+ *   ② At home: climb 20→60 m (5 shots)
+ *   ③ fly_to(next_pos, 20 m) — descend + fly simultaneously
+ *   ④ At next pos: climb 20→60 m (5 shots)
+ *   ⑤ Repeat for all 5 positions
+ *   ⑥ RTL at 110 s (hard deadline before 2-min limit)
+ *   ⑦ Print 2-D error table  +  best (altitude, position) combo
  *
- * Photos saved to result/ as:
- *   {lat_real}_{lon_real}-{lat_est}_{lon_est}__{dist}m_alt{alt}m.png
- *   {lat_real}_{lon_real}-NOFIX_NOFIX__NAm_alt{alt}m.png
+ * Test positions (all ≤ 30 m from home):
+ *   home, 30 m N, 30 m E, 30 m S, 30 m W
+ *
+ * Photos: result/{lat_r}_{lon_r}-{lat_e}_{lon_e}__{dist}m_pos{name}_alt{alt}m.png
  *
  * Build:
  *   cd best_altitude && make
@@ -41,6 +41,7 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <mutex>
 #include <optional>
 #include <sstream>
@@ -55,55 +56,67 @@ using Clock  = std::chrono::steady_clock;
 
 // ── config ────────────────────────────────────────────────────────────────────
 
-static const char*  DEFAULT_PORT       = "/dev/ttyTHS1";
-static const int    DEFAULT_BAUD       = 57600;
-static const int    DEFAULT_ZOOM       = 19;
-static const char*  INDEX_DIR          = "../index";
-static const char*  TILE_DIR           = "../tiles";
-static const char*  RESULT_DIR         = "result";
+static const char*  DEFAULT_PORT      = "/dev/ttyTHS1";
+static const int    DEFAULT_BAUD      = 57600;
+static const int    DEFAULT_ZOOM      = 19;
+static const char*  INDEX_DIR         = "../index";
+static const char*  TILE_DIR          = "../tiles";
+static const char*  RESULT_DIR        = "result";
 
-static const int    MAX_FLIGHT_SECS    = 110;   // force RTL this many seconds after takeoff
-static const float  TAKEOFF_ALT_M     = 20.0f;  // initial takeoff altitude
-static const float  REACH_HORIZ_M     =  3.0f;  // "arrived" horizontal threshold
-static const float  REACH_ALT_M       =  2.5f;  // "arrived" altitude threshold
-static const int    WAIT_REACHED_S    = 25;      // max wait to reach each test point
-static const int    WAIT_ARMED_S      = 12;      // max wait after arm command
-static const int    WAIT_TAKEOFF_S    = 35;      // max wait for takeoff altitude
-static const int    STAB_MS           = 1500;    // stabilise (ms) before photo
+static const int    MAX_FLIGHT_SECS   = 110;   // RTL at this elapsed time
+static const float  REACH_HORIZ_M    =  3.0f;  // horizontal arrival threshold
+static const float  REACH_ALT_M      =  2.5f;  // altitude arrival threshold
+static const int    WAIT_TAKEOFF_S   = 35;      // max wait for takeoff altitude
+static const int    WAIT_REACHED_S   = 40;      // max wait per fly-to command
+static const int    WAIT_ARMED_S     = 12;
+static const int    STAB_MS          = 1500;    // stabilise before each photo
 
-static const int    TILE_SIZE         = 256;
-static const float  MATCH_RATIO       = 0.75f;
-static const int    MIN_INLIERS       = 6;
-static const int    TOP_CANDIDATES    = 20;
+static const int    TILE_SIZE        = 256;
+static const float  MATCH_RATIO      = 0.75f;
+static const int    MIN_INLIERS      = 6;
+static const int    TOP_CANDIDATES   = 20;
 
 // ArduCopter custom modes
 static const uint32_t COPTER_MODE_GUIDED = 4;
 
 // CSI camera
-static const int    CSI_SENSOR_ID     = 0;
-static const int    CSI_WIDTH         = 1280;
-static const int    CSI_HEIGHT        = 720;
-static const int    CSI_FPS           = 30;
-static const int    CSI_FLIP          = 0;   // 0 = none, 2 = 180°
+static const int    CSI_SENSOR_ID    = 0;
+static const int    CSI_WIDTH        = 1280;
+static const int    CSI_HEIGHT       = 720;
+static const int    CSI_FPS          = 30;
+static const int    CSI_FLIP         = 0;
 
 static std::atomic<bool> g_shutdown{false};
-
-// ── signal handler ────────────────────────────────────────────────────────────
-
 static void handle_signal(int) { g_shutdown = true; }
 
-// ── test pattern ─────────────────────────────────────────────────────────────
+// ── test matrix ───────────────────────────────────────────────────────────────
 
-struct TestPoint { double north_m, east_m, alt_m; };
+struct Position { double north_m, east_m; const char* name; };
 
-static const TestPoint TEST_POINTS[] = {
-    {   0.0,   0.0, 20.0 },   // directly above home
-    {  20.0,   0.0, 30.0 },   // 20 m north
-    {   0.0,  20.0, 40.0 },   // 20 m east
-    { -20.0,   0.0, 50.0 },   // 20 m south
-    {   0.0, -20.0, 60.0 },   // 20 m west
+static const Position POSITIONS[] = {
+    {   0.0,   0.0, "home" },
+    {  30.0,   0.0, "30N"  },
+    {   0.0,  30.0, "30E"  },
+    { -30.0,   0.0, "30S"  },
+    {   0.0, -30.0, "30W"  },
 };
-static const int N_POINTS = (int)(sizeof(TEST_POINTS)/sizeof(TEST_POINTS[0]));
+static const float ALTITUDES[]  = { 20.0f, 30.0f, 40.0f, 50.0f, 60.0f };
+static const int   N_POSITIONS  = (int)(sizeof(POSITIONS) / sizeof(POSITIONS[0]));
+static const int   N_ALTITUDES  = (int)(sizeof(ALTITUDES) / sizeof(ALTITUDES[0]));
+
+// ── result table ──────────────────────────────────────────────────────────────
+
+static const double NOT_TESTED = -2.0;   // placeholder: drone did not reach it
+static const double NOFIX      = -1.0;   // reached but SIFT returned no match
+
+static double g_results[N_POSITIONS][N_ALTITUDES];   // [pos][alt] = error in m
+
+static void init_results()
+{
+    for (int pi = 0; pi < N_POSITIONS; ++pi)
+        for (int ai = 0; ai < N_ALTITUDES; ++ai)
+            g_results[pi][ai] = NOT_TESTED;
+}
 
 // ── coordinate math ───────────────────────────────────────────────────────────
 
@@ -129,7 +142,6 @@ static double haversine_m(double lat1, double lon1, double lat2, double lon2)
     return 2.0 * R * std::asin(std::sqrt(a));
 }
 
-// Offset a GPS coordinate by metres (flat-earth approximation, good < 1 km)
 static std::pair<double,double> offset_latlon(
     double lat, double lon, double north_m, double east_m)
 {
@@ -142,7 +154,7 @@ static std::pair<double,double> offset_latlon(
 
 struct TileEntry {
     int    tile_x, tile_y, zoom;
-    cv::Mat descs;   // (N × 128) CV_32F
+    cv::Mat descs;
 };
 
 static std::vector<TileEntry> load_index(const std::string& path)
@@ -314,8 +326,6 @@ static std::optional<MatchResult> direct_match(
     return MatchResult{lat, lon, inliers};
 }
 
-// ── localize one frame ────────────────────────────────────────────────────────
-
 static std::optional<MatchResult> localize_frame(
     const cv::Mat& frame,
     const std::vector<TileEntry>& index,
@@ -336,10 +346,7 @@ static std::optional<MatchResult> localize_frame(
     std::cout << "  Query features : " << kps_q.size() << " kp\n";
 
     auto ranked = flann_vote(descs_q, fi);
-    if (ranked.empty()) {
-        std::cout << "  No FLANN votes.\n";
-        return std::nullopt;
-    }
+    if (ranked.empty()) { std::cout << "  No FLANN votes.\n"; return std::nullopt; }
 
     int n_try = std::min((int)ranked.size(), TOP_CANDIDATES);
     for (int i = 0; i < n_try; ++i) {
@@ -353,7 +360,7 @@ static std::optional<MatchResult> localize_frame(
     return std::nullopt;
 }
 
-// ── vehicle state (thread-safe) ───────────────────────────────────────────────
+// ── vehicle state ─────────────────────────────────────────────────────────────
 
 struct VehicleState {
     std::mutex mtx;
@@ -378,10 +385,10 @@ struct VehicleState {
         custom_mode = cust_mode;
     }
 
-    struct Snap { double alt_m, lat, lon; bool gps_ok, armed; uint32_t custom_mode; };
+    struct Snap { double alt_m, lat, lon; bool gps_ok, armed; };
     Snap snapshot() {
         std::lock_guard<std::mutex> lk(mtx);
-        return {alt_m, lat, lon, gps_ok, armed, custom_mode};
+        return {alt_m, lat, lon, gps_ok, armed};
     }
 };
 
@@ -395,7 +402,6 @@ static int open_serial(const char* port, int baud)
 
     struct termios tty {};
     tcgetattr(fd, &tty);
-
     speed_t speed = B57600;
     if      (baud == 9600)   speed = B9600;
     else if (baud == 19200)  speed = B19200;
@@ -403,21 +409,15 @@ static int open_serial(const char* port, int baud)
     else if (baud == 57600)  speed = B57600;
     else if (baud == 115200) speed = B115200;
     else if (baud == 230400) speed = B230400;
-    cfsetispeed(&tty, speed);
-    cfsetospeed(&tty, speed);
-
-    tty.c_cflag &= ~PARENB;
-    tty.c_cflag &= ~CSTOPB;
-    tty.c_cflag &= ~CSIZE;
-    tty.c_cflag |=  CS8;
-    tty.c_cflag &= ~CRTSCTS;
-    tty.c_cflag |=  CREAD | CLOCAL;
+    cfsetispeed(&tty, speed); cfsetospeed(&tty, speed);
+    tty.c_cflag &= ~PARENB; tty.c_cflag &= ~CSTOPB;
+    tty.c_cflag &= ~CSIZE;  tty.c_cflag |= CS8;
+    tty.c_cflag &= ~CRTSCTS; tty.c_cflag |= CREAD | CLOCAL;
     tty.c_lflag &= ~(ICANON | ECHO | ECHOE | ISIG);
     tty.c_iflag &= ~(IXON | IXOFF | IXANY);
     tty.c_iflag &= ~(IGNBRK | BRKINT | PARMRK | ISTRIP | INLCR | IGNCR | ICRNL);
     tty.c_oflag &= ~OPOST;
-    tty.c_cc[VMIN]  = 0;
-    tty.c_cc[VTIME] = 10;   // 100 ms read timeout
+    tty.c_cc[VMIN] = 0; tty.c_cc[VTIME] = 10;
     tcsetattr(fd, TCSANOW, &tty);
     return fd;
 }
@@ -431,8 +431,7 @@ static void mavlink_reader(int fd, VehicleState& state)
     uint8_t byte;
 
     while (!g_shutdown) {
-        ssize_t n = ::read(fd, &byte, 1);
-        if (n <= 0) continue;
+        if (::read(fd, &byte, 1) <= 0) continue;
         if (mavlink_parse_char(MAVLINK_COMM_0, byte, &msg, &status)) {
             switch (msg.msgid) {
             case MAVLINK_MSG_ID_GLOBAL_POSITION_INT: {
@@ -444,7 +443,6 @@ static void mavlink_reader(int fd, VehicleState& state)
             case MAVLINK_MSG_ID_HEARTBEAT: {
                 mavlink_heartbeat_t hb;
                 mavlink_msg_heartbeat_decode(&msg, &hb);
-                // ignore GCS heartbeats (MAV_TYPE_GCS = 6)
                 if (hb.type != MAV_TYPE_GCS)
                     state.update_hb(hb.base_mode, hb.custom_mode);
                 break;
@@ -454,7 +452,7 @@ static void mavlink_reader(int fd, VehicleState& state)
     }
 }
 
-// ── MAVLink write helpers (main thread only) ──────────────────────────────────
+// ── MAVLink send helpers ──────────────────────────────────────────────────────
 
 static void mav_write(int fd, const mavlink_message_t& msg)
 {
@@ -476,10 +474,17 @@ static void send_command_long(int fd, uint16_t cmd,
     float p5=0, float p6=0, float p7=0)
 {
     mavlink_message_t msg;
-    mavlink_msg_command_long_pack(1, 200, &msg,
-        1, 1,   // target system, component
-        cmd, 0, p1, p2, p3, p4, p5, p6, p7);
+    mavlink_msg_command_long_pack(1, 200, &msg, 1, 1, cmd, 0,
+        p1, p2, p3, p4, p5, p6, p7);
     mav_write(fd, msg);
+}
+
+static void heartbeat_sender(int fd)
+{
+    while (!g_shutdown) {
+        send_heartbeat(fd);
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+    }
 }
 
 // ── flight control ────────────────────────────────────────────────────────────
@@ -487,43 +492,31 @@ static void send_command_long(int fd, uint16_t cmd,
 static void set_guided_mode(int fd)
 {
     send_command_long(fd, MAV_CMD_DO_SET_MODE,
-        MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
-        (float)COPTER_MODE_GUIDED);
+        MAV_MODE_FLAG_CUSTOM_MODE_ENABLED, (float)COPTER_MODE_GUIDED);
 }
 
-static void cmd_arm(int fd)
-{
+static void cmd_arm(int fd) {
     send_command_long(fd, MAV_CMD_COMPONENT_ARM_DISARM, 1.0f);
 }
 
-static void cmd_takeoff(int fd, float alt_m)
-{
-    // param7 = altitude (m above home)
+static void cmd_takeoff(int fd, float alt_m) {
     send_command_long(fd, MAV_CMD_NAV_TAKEOFF, 0,0,0,0,0,0, alt_m);
 }
 
-// SET_POSITION_TARGET_GLOBAL_INT — fly to GPS position in GUIDED mode
-// type_mask 0x0FF8: use position only, ignore velocity/accel/yaw
+// SET_POSITION_TARGET_GLOBAL_INT — position only (type_mask 0x0FF8)
 static void fly_to(int fd, double lat, double lon, float alt_m)
 {
     mavlink_message_t msg;
     mavlink_msg_set_position_target_global_int_pack(
-        1, 200, &msg,
-        0,      // time_boot_ms (ignored)
-        1, 1,   // target system, component
+        1, 200, &msg, 0, 1, 1,
         MAV_FRAME_GLOBAL_RELATIVE_ALT_INT,
-        0x0FF8, // position only
-        (int32_t)(lat * 1e7),
-        (int32_t)(lon * 1e7),
-        alt_m,
-        0.0f, 0.0f, 0.0f,   // velocity (ignored)
-        0.0f, 0.0f, 0.0f,   // acceleration (ignored)
-        0.0f, 0.0f);         // yaw, yaw_rate (ignored)
+        0x0FF8,
+        (int32_t)(lat * 1e7), (int32_t)(lon * 1e7), alt_m,
+        0, 0, 0, 0, 0, 0, 0, 0);
     mav_write(fd, msg);
 }
 
-static void cmd_rtl(int fd)
-{
+static void cmd_rtl(int fd) {
     send_command_long(fd, MAV_CMD_NAV_RETURN_TO_LAUNCH);
 }
 
@@ -531,8 +524,8 @@ static void cmd_rtl(int fd)
 
 static bool wait_gps(VehicleState& state, int timeout_s = 30)
 {
-    auto deadline = Clock::now() + std::chrono::seconds(timeout_s);
-    while (!g_shutdown && Clock::now() < deadline) {
+    auto dl = Clock::now() + std::chrono::seconds(timeout_s);
+    while (!g_shutdown && Clock::now() < dl) {
         if (state.snapshot().gps_ok) return true;
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
     }
@@ -541,34 +534,31 @@ static bool wait_gps(VehicleState& state, int timeout_s = 30)
 
 static bool wait_armed(VehicleState& state, int timeout_s = WAIT_ARMED_S)
 {
-    auto deadline = Clock::now() + std::chrono::seconds(timeout_s);
-    while (!g_shutdown && Clock::now() < deadline) {
+    auto dl = Clock::now() + std::chrono::seconds(timeout_s);
+    while (!g_shutdown && Clock::now() < dl) {
         if (state.snapshot().armed) return true;
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
     }
     return false;
 }
 
-// Wait until relative altitude is within tolerance of target
 static bool wait_altitude(VehicleState& state, float target_m,
                            float tol = REACH_ALT_M, int timeout_s = WAIT_TAKEOFF_S)
 {
-    auto deadline = Clock::now() + std::chrono::seconds(timeout_s);
-    while (!g_shutdown && Clock::now() < deadline) {
-        float alt = (float)state.snapshot().alt_m;
-        if (std::abs(alt - target_m) <= tol) return true;
+    auto dl = Clock::now() + std::chrono::seconds(timeout_s);
+    while (!g_shutdown && Clock::now() < dl) {
+        if (std::abs((float)state.snapshot().alt_m - target_m) <= tol) return true;
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
     }
     return false;
 }
 
-// Wait until drone is within REACH_HORIZ_M horizontal and REACH_ALT_M vertical of target
 static bool wait_reached(VehicleState& state,
                           double tgt_lat, double tgt_lon, float tgt_alt,
                           int timeout_s = WAIT_REACHED_S)
 {
-    auto deadline = Clock::now() + std::chrono::seconds(timeout_s);
-    while (!g_shutdown && Clock::now() < deadline) {
+    auto dl = Clock::now() + std::chrono::seconds(timeout_s);
+    while (!g_shutdown && Clock::now() < dl) {
         auto s = state.snapshot();
         if (s.gps_ok) {
             float hdist = (float)haversine_m(s.lat, s.lon, tgt_lat, tgt_lon);
@@ -580,19 +570,17 @@ static bool wait_reached(VehicleState& state,
     return false;
 }
 
-// ── CSI camera pipeline ───────────────────────────────────────────────────────
+// ── CSI camera ────────────────────────────────────────────────────────────────
 
 static std::string gst_pipeline(int sensor_id, int w, int h, int fps, int flip)
 {
     std::ostringstream ss;
     ss << "nvarguscamerasrc sensor-id=" << sensor_id << " ! "
        << "video/x-raw(memory:NVMM), width=(int)" << w
-       << ", height=(int)" << h
-       << ", framerate=(fraction)" << fps << "/1 ! "
+       << ", height=(int)" << h << ", framerate=(fraction)" << fps << "/1 ! "
        << "nvvidconv flip-method=" << flip << " ! "
        << "video/x-raw, width=(int)" << w << ", height=(int)" << h
-       << ", format=(string)BGRx ! "
-       << "videoconvert ! "
+       << ", format=(string)BGRx ! videoconvert ! "
        << "video/x-raw, format=(string)BGR ! appsink";
     return ss.str();
 }
@@ -602,7 +590,7 @@ static std::string gst_pipeline(int sensor_id, int w, int h, int fps, int flip)
 static std::string build_filename(double real_lat, double real_lon,
                                    double est_lat,  double est_lon,
                                    bool has_fix,    double dist_m,
-                                   double alt_m)
+                                   const char* pos_name, float alt_m)
 {
     std::ostringstream ss;
     ss << std::fixed << std::setprecision(7);
@@ -612,18 +600,71 @@ static std::string build_filename(double real_lat, double real_lon,
            << "__" << std::setprecision(1) << dist_m << "m";
     else
         ss << "NOFIX_NOFIX__NAm";
-    ss << "_alt" << std::setprecision(0) << alt_m << "m.png";
+    ss << "_pos" << pos_name
+       << "_alt" << std::setprecision(0) << alt_m << "m.png";
     return ss.str();
 }
 
-// ── heartbeat sender (keeps GCS failsafe from triggering) ─────────────────────
+// ── summary printer ───────────────────────────────────────────────────────────
 
-static void heartbeat_sender(int fd)
+static void print_summary()
 {
-    while (!g_shutdown) {
-        send_heartbeat(fd);
-        std::this_thread::sleep_for(std::chrono::seconds(1));
+    std::cout << "\n" << std::string(60,'=') << "\n";
+    std::cout << "  SURVEY RESULTS  (SIFT error in metres)\n";
+    std::cout << std::string(60,'=') << "\n";
+
+    // Header row
+    std::cout << std::left << std::setw(8) << "Alt(m)";
+    for (int pi = 0; pi < N_POSITIONS; ++pi)
+        std::cout << std::setw(10) << POSITIONS[pi].name;
+    std::cout << "\n" << std::string(60,'-') << "\n";
+
+    double best_err = std::numeric_limits<double>::max();
+    int    best_ai  = -1, best_pi = -1;
+
+    for (int ai = 0; ai < N_ALTITUDES; ++ai) {
+        std::cout << std::left << std::setw(8) << (int)ALTITUDES[ai];
+        for (int pi = 0; pi < N_POSITIONS; ++pi) {
+            double v = g_results[pi][ai];
+            std::ostringstream cell;
+            if      (v == NOT_TESTED) cell << "--";
+            else if (v == NOFIX)      cell << "NOFIX";
+            else {
+                cell << std::fixed << std::setprecision(1) << v;
+                if (v < best_err) { best_err = v; best_ai = ai; best_pi = pi; }
+            }
+            std::cout << std::setw(10) << cell.str();
+        }
+        std::cout << "\n";
     }
+
+    std::cout << std::string(60,'=') << "\n";
+
+    // Per-altitude average (across positions that were tested)
+    std::cout << "\n  Per-altitude mean error (tested positions only):\n";
+    for (int ai = 0; ai < N_ALTITUDES; ++ai) {
+        double sum = 0; int cnt = 0;
+        for (int pi = 0; pi < N_POSITIONS; ++pi) {
+            double v = g_results[pi][ai];
+            if (v >= 0.0) { sum += v; cnt++; }
+        }
+        std::cout << "    " << std::setw(3) << (int)ALTITUDES[ai] << " m : ";
+        if (cnt > 0)
+            std::cout << std::fixed << std::setprecision(1) << sum/cnt
+                      << " m  (n=" << cnt << ")";
+        else
+            std::cout << "no valid data";
+        std::cout << "\n";
+    }
+
+    if (best_ai >= 0 && best_pi >= 0) {
+        std::cout << "\n  BEST : " << (int)ALTITUDES[best_ai] << " m"
+                  << " at " << POSITIONS[best_pi].name
+                  << "  (error = " << std::setprecision(1) << best_err << " m)\n";
+    } else {
+        std::cout << "\n  No valid SIFT fix obtained in this survey.\n";
+    }
+    std::cout << std::string(60,'=') << "\n";
 }
 
 // ── main ─────────────────────────────────────────────────────────────────────
@@ -645,16 +686,17 @@ int main(int argc, char* argv[])
         }
     }
 
-    signal(SIGINT,  handle_signal);
+    signal(SIGINT, handle_signal);
     signal(SIGTERM, handle_signal);
-
+    init_results();
     fs::create_directories(RESULT_DIR);
-    std::cout << "Result photos  → " << fs::absolute(RESULT_DIR) << "\n";
-    std::cout << "Max flight     : " << MAX_FLIGHT_SECS << " s (RTL at timeout)\n";
-    std::cout << "Test altitudes : 20 / 30 / 40 / 50 / 60 m\n";
-    std::cout << "Max radius     : 50 m from home\n\n";
 
-    // ── load tile index + build FLANN ─────────────────────────────────────────
+    std::cout << "Result photos  -> " << fs::absolute(RESULT_DIR) << "\n";
+    std::cout << "Max flight     : " << MAX_FLIGHT_SECS << " s\n";
+    std::cout << "Test positions : home / 30N / 30E / 30S / 30W\n";
+    std::cout << "Test altitudes : 20 / 30 / 40 / 50 / 60 m\n\n";
+
+    // ── load tile index + FLANN ───────────────────────────────────────────────
     std::string index_path = std::string(INDEX_DIR) + "/sift_index_z"
                              + std::to_string(zoom) + ".bin";
     std::cout << "Loading index  : " << index_path << " … " << std::flush;
@@ -663,29 +705,27 @@ int main(int argc, char* argv[])
         index = load_index(index_path);
     } catch (const std::exception& e) {
         std::cerr << "\nERROR: " << e.what() << "\n"
-                  << "Run export_index.py first to generate the .bin index.\n";
+                  << "Run export_index.py first.\n";
         return 1;
     }
     std::cout << index.size() << " tiles.\n";
     FlannIndex fi = build_flann(index);
 
-    // ── open serial ───────────────────────────────────────────────────────────
-    std::cout << "MAVLink serial : " << port << " @ " << baud << " baud … " << std::flush;
+    // ── serial + threads ──────────────────────────────────────────────────────
+    std::cout << "MAVLink serial : " << port << " @ " << baud << " … " << std::flush;
     int serial_fd;
     try {
         serial_fd = open_serial(port, baud);
     } catch (const std::exception& e) {
-        std::cerr << "\nERROR: " << e.what() << "\n";
-        return 1;
+        std::cerr << "\nERROR: " << e.what() << "\n"; return 1;
     }
     std::cout << "ok.\n";
 
-    // ── start background threads ──────────────────────────────────────────────
     VehicleState state;
     std::thread mav_th(mavlink_reader, serial_fd, std::ref(state));
     std::thread hb_th(heartbeat_sender, serial_fd);
 
-    // ── open CSI camera ───────────────────────────────────────────────────────
+    // ── camera ────────────────────────────────────────────────────────────────
     std::string pipeline = gst_pipeline(CSI_SENSOR_ID, CSI_WIDTH, CSI_HEIGHT,
                                         CSI_FPS, CSI_FLIP);
     cv::VideoCapture cap(pipeline, cv::CAP_GSTREAMER);
@@ -701,7 +741,7 @@ int main(int argc, char* argv[])
     // ── wait for GPS ──────────────────────────────────────────────────────────
     std::cout << "Waiting for Pixhawk GPS …" << std::flush;
     if (!wait_gps(state, 60)) {
-        std::cerr << "\nERROR: No GPS within 60 s — aborting.\n";
+        std::cerr << "\nERROR: No GPS within 60 s.\n";
         g_shutdown = true;
         mav_th.join(); hb_th.join();
         close(serial_fd);
@@ -709,29 +749,25 @@ int main(int argc, char* argv[])
     }
     std::cout << " ok.\n";
 
-    // ── record home position ──────────────────────────────────────────────────
     double home_lat, home_lon;
     {
-        auto s  = state.snapshot();
+        auto s = state.snapshot();
         home_lat = s.lat;
         home_lon = s.lon;
     }
     std::cout << "Home position  : " << std::fixed << std::setprecision(7)
               << home_lat << ", " << home_lon << "\n\n";
 
-    // ── flight sequence ───────────────────────────────────────────────────────
+    // ── flight ────────────────────────────────────────────────────────────────
     bool airborne = false;
 
-    auto safe_abort = [&](const char* reason) {
+    auto abort_flight = [&](const char* reason) {
         std::cerr << "ABORT: " << reason << "\n";
-        if (airborne) {
-            std::cout << "Sending RTL for safety.\n";
-            cmd_rtl(serial_fd);
-        }
+        if (airborne) { std::cout << "RTL for safety.\n"; cmd_rtl(serial_fd); }
         g_shutdown = true;
     };
 
-    // Step 1: GUIDED mode
+    // GUIDED mode
     std::cout << std::string(60,'-') << "\n";
     std::cout << "Setting GUIDED mode …\n";
     set_guided_mode(serial_fd);
@@ -739,161 +775,145 @@ int main(int argc, char* argv[])
 
     if (g_shutdown) goto cleanup;
 
-    // Step 2: Arm
+    // Arm
     std::cout << "Arming …\n";
     cmd_arm(serial_fd);
-    if (!wait_armed(state, WAIT_ARMED_S)) {
-        safe_abort("arm timeout — check pre-arm conditions");
-        goto cleanup;
-    }
+    if (!wait_armed(state)) { abort_flight("arm timeout"); goto cleanup; }
     std::cout << "Armed.\n";
 
-    // Step 3: Takeoff
+    // Takeoff to first altitude (20 m)
     {
-        float first_alt = TAKEOFF_ALT_M;
+        float first_alt = ALTITUDES[0];
         std::cout << "Takeoff to " << std::fixed << std::setprecision(0)
                   << first_alt << " m …\n";
         cmd_takeoff(serial_fd, first_alt);
-        if (!wait_altitude(state, first_alt, REACH_ALT_M, WAIT_TAKEOFF_S)) {
-            safe_abort("takeoff altitude not reached");
+        if (!wait_altitude(state, first_alt)) {
+            abort_flight("takeoff altitude not reached");
             goto cleanup;
         }
         airborne = true;
-        std::cout << "Airborne at " << std::setprecision(1)
-                  << state.snapshot().alt_m << " m.\n\n";
+        std::cout << "Airborne. alt=" << std::setprecision(1)
+                  << state.snapshot().alt_m << " m\n\n";
     }
 
-    // Step 4: Test loop
+    // ── main survey loop ──────────────────────────────────────────────────────
     {
         auto flight_start = Clock::now();
-        struct TestResult { double alt_m; double dist_m; bool has_fix; };
-        std::vector<TestResult> results;
 
-        for (int i = 0; i < N_POINTS && !g_shutdown; ++i) {
+        // Helper lambda: seconds elapsed since takeoff
+        auto elapsed_s = [&]() {
+            return std::chrono::duration<double>(Clock::now() - flight_start).count();
+        };
 
-            // Check time budget
-            double elapsed = std::chrono::duration<double>(
-                Clock::now() - flight_start).count();
-            if (elapsed >= (double)MAX_FLIGHT_SECS) {
-                std::cout << "\nTime budget reached (" << (int)elapsed
-                          << " s) — skipping remaining points.\n";
-                break;
-            }
+        for (int pi = 0; pi < N_POSITIONS && !g_shutdown; ++pi) {
 
-            const TestPoint& tp = TEST_POINTS[i];
-            auto [tgt_lat, tgt_lon] = offset_latlon(home_lat, home_lon,
-                                                     tp.north_m, tp.east_m);
-            float tgt_alt = (float)tp.alt_m;
+            // Compute absolute GPS target for this position
+            auto [pos_lat, pos_lon] = offset_latlon(home_lat, home_lon,
+                POSITIONS[pi].north_m, POSITIONS[pi].east_m);
 
-            std::cout << std::string(60,'-') << "\n";
-            std::cout << "Test " << (i+1) << "/" << N_POINTS
-                      << "  alt=" << std::setprecision(0) << tgt_alt << " m"
-                      << "  offset=(" << tp.north_m << " N, "
-                      << tp.east_m << " E)\n";
-            std::cout << "  Budget remaining : "
-                      << std::setprecision(0) << (MAX_FLIGHT_SECS - elapsed) << " s\n";
+            // Travel to this position at 20 m altitude.
+            // For home (pi==0) we are already there after takeoff.
+            // For subsequent positions: issue fly_to at 20 m so the drone descends
+            // and moves horizontally at the same time.
+            if (pi > 0) {
+                std::cout << std::string(60,'-') << "\n";
+                std::cout << "Flying to " << POSITIONS[pi].name
+                          << " @ 20 m  (elapsed " << std::setprecision(0)
+                          << elapsed_s() << " s / " << MAX_FLIGHT_SECS << " s)\n";
 
-            // Fly to test position
-            fly_to(serial_fd, tgt_lat, tgt_lon, tgt_alt);
-
-            if (!wait_reached(state, tgt_lat, tgt_lon, tgt_alt, WAIT_REACHED_S)) {
-                std::cout << "  Position not reached in " << WAIT_REACHED_S
-                          << " s — skipping.\n";
-                results.push_back({tgt_alt, -1.0, false});
-                continue;
-            }
-
-            // Check budget again after flying
-            elapsed = std::chrono::duration<double>(
-                Clock::now() - flight_start).count();
-            if (elapsed >= (double)MAX_FLIGHT_SECS) {
-                std::cout << "  Time budget exceeded after flight — skipping capture.\n";
-                break;
-            }
-
-            // Stabilise
-            std::this_thread::sleep_for(std::chrono::milliseconds(STAB_MS));
-
-            // Read true GPS
-            auto s = state.snapshot();
-            std::cout << "  Position reached  alt=" << std::setprecision(1)
-                      << s.alt_m << " m\n";
-            std::cout << "  Real GPS : " << std::setprecision(7)
-                      << s.lat << ", " << s.lon << "\n";
-
-            // Capture frame
-            cv::Mat frame;
-            if (!cap.read(frame) || frame.empty()) {
-                std::cerr << "  Camera read failed — skipping.\n";
-                results.push_back({tgt_alt, -1.0, false});
-                continue;
-            }
-
-            // SIFT localization
-            auto res = localize_frame(frame, index, fi, zoom);
-            bool   has_fix = res.has_value();
-            double est_lat = 0, est_lon = 0, dist_m = -1.0;
-
-            if (has_fix) {
-                est_lat = res->lat;
-                est_lon = res->lon;
-                dist_m  = haversine_m(s.lat, s.lon, est_lat, est_lon);
-                std::cout << "  Est. GPS : " << std::setprecision(7)
-                          << est_lat << ", " << est_lon << "\n";
-                std::cout << "  Inliers  : " << res->inliers
-                          << "   Error: " << std::setprecision(1) << dist_m << " m\n";
-            } else {
-                std::cout << "  Est. GPS : NOFIX\n";
-            }
-
-            results.push_back({tgt_alt, dist_m, has_fix});
-
-            // Save photo — filename encodes all measurement data
-            std::string fname = build_filename(s.lat, s.lon,
-                                               est_lat, est_lon, has_fix,
-                                               dist_m, tgt_alt);
-            cv::imwrite(std::string(RESULT_DIR) + "/" + fname, frame);
-            std::cout << "  Saved    : " << fname << "\n";
-        }
-
-        // Step 5: RTL
-        std::cout << "\n" << std::string(60,'-') << "\n";
-        std::cout << "RTL …\n";
-        cmd_rtl(serial_fd);
-
-        // Step 6: Print summary
-        std::cout << "\n" << std::string(50,'=') << "\n";
-        std::cout << "  BEST ALTITUDE SUMMARY\n";
-        std::cout << std::string(50,'=') << "\n";
-        std::cout << std::fixed;
-
-        double best_dist = 1e9;
-        double best_alt  = -1.0;
-
-        for (auto& r : results) {
-            std::cout << "  Alt " << std::setw(4) << std::setprecision(0)
-                      << r.alt_m << " m : ";
-            if (r.has_fix) {
-                std::cout << std::setprecision(1) << r.dist_m << " m error";
-                if (r.dist_m < best_dist) {
-                    best_dist = r.dist_m;
-                    best_alt  = r.alt_m;
+                if (elapsed_s() >= MAX_FLIGHT_SECS) {
+                    std::cout << "Time budget reached — ending survey.\n";
+                    break;
                 }
-            } else {
-                std::cout << "NOFIX (not reached or no match)";
-            }
-            std::cout << "\n";
-        }
 
-        if (best_alt > 0.0) {
-            std::cout << "\n  BEST : " << std::setprecision(0) << best_alt
-                      << " m  (SIFT error = "
-                      << std::setprecision(1) << best_dist << " m)\n";
-        } else {
-            std::cout << "\n  No valid SIFT fix obtained.\n";
+                fly_to(serial_fd, pos_lat, pos_lon, ALTITUDES[0]);
+                if (!wait_reached(state, pos_lat, pos_lon, ALTITUDES[0])) {
+                    std::cout << "  Could not reach " << POSITIONS[pi].name
+                              << " in time — skipping.\n";
+                    continue;
+                }
+            }
+
+            std::cout << std::string(60,'=') << "\n";
+            std::cout << "Position : " << POSITIONS[pi].name
+                      << "  (offset " << POSITIONS[pi].north_m << " N, "
+                      << POSITIONS[pi].east_m << " E)\n";
+            std::cout << std::string(60,'=') << "\n";
+
+            // Sweep altitudes 20 → 60 m (ascending — faster than descending)
+            for (int ai = 0; ai < N_ALTITUDES && !g_shutdown; ++ai) {
+
+                float tgt_alt = ALTITUDES[ai];
+
+                if (elapsed_s() >= MAX_FLIGHT_SECS) {
+                    std::cout << "Time budget reached — ending survey.\n";
+                    goto rtl;
+                }
+
+                std::cout << "  Climbing to " << std::setprecision(0) << tgt_alt << " m"
+                          << "  (budget left: " << std::setprecision(0)
+                          << (MAX_FLIGHT_SECS - elapsed_s()) << " s)\n";
+
+                // Fly to same horizontal position at new altitude
+                fly_to(serial_fd, pos_lat, pos_lon, tgt_alt);
+                if (!wait_reached(state, pos_lat, pos_lon, tgt_alt)) {
+                    std::cout << "  Altitude " << (int)tgt_alt
+                              << " m not reached — skipping.\n";
+                    continue;
+                }
+
+                // Stabilise
+                std::this_thread::sleep_for(std::chrono::milliseconds(STAB_MS));
+
+                // Read true GPS
+                auto s = state.snapshot();
+                std::cout << "  alt=" << std::setprecision(1) << s.alt_m
+                          << " m   Real GPS: " << std::setprecision(7)
+                          << s.lat << ", " << s.lon << "\n";
+
+                // Capture
+                cv::Mat frame;
+                if (!cap.read(frame) || frame.empty()) {
+                    std::cerr << "  Camera read failed — skipping.\n";
+                    g_results[pi][ai] = NOFIX;
+                    continue;
+                }
+
+                // SIFT
+                auto res = localize_frame(frame, index, fi, zoom);
+                bool   has_fix = res.has_value();
+                double est_lat = 0, est_lon = 0, dist_m = -1.0;
+
+                if (has_fix) {
+                    est_lat = res->lat;
+                    est_lon = res->lon;
+                    dist_m  = haversine_m(s.lat, s.lon, est_lat, est_lon);
+                    std::cout << "  Est. GPS: " << std::setprecision(7)
+                              << est_lat << ", " << est_lon
+                              << "  error=" << std::setprecision(1) << dist_m << " m"
+                              << "  inliers=" << res->inliers << "\n";
+                    g_results[pi][ai] = dist_m;
+                } else {
+                    std::cout << "  NOFIX\n";
+                    g_results[pi][ai] = NOFIX;
+                }
+
+                // Save photo
+                std::string fname = build_filename(s.lat, s.lon,
+                    est_lat, est_lon, has_fix, dist_m,
+                    POSITIONS[pi].name, tgt_alt);
+                cv::imwrite(std::string(RESULT_DIR) + "/" + fname, frame);
+                std::cout << "  Saved: " << fname << "\n";
+            }
         }
-        std::cout << std::string(50,'=') << "\n";
     }
+
+rtl:
+    std::cout << "\n" << std::string(60,'-') << "\n";
+    std::cout << "Survey complete — RTL.\n";
+    cmd_rtl(serial_fd);
+
+    print_summary();
 
 cleanup:
     g_shutdown = true;
