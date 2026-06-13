@@ -131,6 +131,10 @@ static float hacc_from_inliers(int inliers)
 // ignore_flags = 191: ignore alt(1)|hdop(2)|vdop(4)|vel_h(8)|vel_v(16)|
 //                          speed_acc(32)|vert_acc(128)
 // We DO send horiz_accuracy (bit 64 NOT set in ignore mask).
+// gps_id = 1  →  GPS2.  GPS1 remains the real GNSS module.
+// ArduPilot GPS_AUTO_SWITCH=4 picks whichever has lower hacc:
+//   good SIFT fix (hacc 10–30 m) vs blocked GNSS (hacc 100–500 m) → SIFT wins.
+//   clear sky GNSS (hacc 1–3 m)  vs SIFT              → real GPS wins.
 static void send_gps_input(int fd, double lat, double lon, float hacc)
 {
     mavlink_message_t msg;
@@ -139,7 +143,7 @@ static void send_gps_input(int fd, double lat, double lon, float hacc)
     mavlink_msg_gps_input_pack(
         1, 200, &msg,
         0,                          // time_usec (0 = autopilot uses own clock)
-        0,                          // gps_id
+        1,                          // gps_id = 1  →  GPS2 (GPS1 = real GNSS)
         191,                        // ignore_flags (see above)
         0, 0,                       // time_week_ms, time_week (ignored)
         3,                          // fix_type: 3D fix
@@ -304,7 +308,7 @@ static std::vector<Waypoint> fetch_mission_from_pixhawk(int fd)
 
     // Step 4 — acknowledge receipt
     mavlink_msg_mission_ack_pack(1, 200, &req, 1, 1,
-                                  MAV_MISSION_ACCEPTED, MAV_MISSION_TYPE_MISSION);
+                                  MAV_MISSION_ACCEPTED, MAV_MISSION_TYPE_MISSION, 0);
     send_raw(req);
 
     std::cout << "[mission] " << wps.size() << " navigation waypoint(s) loaded.\n";

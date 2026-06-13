@@ -85,17 +85,16 @@ def send_gps_input(conn, lat, lon, alt_msl):
     """
     week, week_ms = gps_week_ms()
 
-    # Ignore velocity and accuracy — only provide position + DOP
-    ignore = (mavutil.mavlink.GPS_INPUT_IGNORE_FLAG_VEL_HORIZ        |
-              mavutil.mavlink.GPS_INPUT_IGNORE_FLAG_VEL_VERT         |
-              mavutil.mavlink.GPS_INPUT_IGNORE_FLAG_SPEED_ACCURACY   |
-              mavutil.mavlink.GPS_INPUT_IGNORE_FLAG_HORIZONTAL_ACCURACY |
+    # Ignore only velocity — send position + hacc so GPS_AUTO_SWITCH=4 can compare
+    ignore = (mavutil.mavlink.GPS_INPUT_IGNORE_FLAG_VEL_HORIZ      |
+              mavutil.mavlink.GPS_INPUT_IGNORE_FLAG_VEL_VERT       |
+              mavutil.mavlink.GPS_INPUT_IGNORE_FLAG_SPEED_ACCURACY |
               mavutil.mavlink.GPS_INPUT_IGNORE_FLAG_VERTICAL_ACCURACY)
 
     try:
         conn.mav.gps_input_send(
             int(time.time() * 1e6),  # time_usec
-            0,                        # gps_id: 0 = GPS1
+            1,                        # gps_id: 1 = GPS2  (GPS1 = real GNSS module)
             ignore,
             week_ms,                  # time_week_ms
             week,                     # time_week
@@ -107,7 +106,7 @@ def send_gps_input(conn, lat, lon, alt_msl):
             1.5,                      # vdop
             0.0, 0.0, 0.0,           # vn, ve, vd  (ignored)
             0.0,                      # speed_accuracy  (ignored)
-            0.0,                      # horiz_accuracy  (ignored)
+            0.5,                      # horiz_accuracy 0.5 m — always beats real GPS, GPS2 wins
             0.0,                      # vert_accuracy   (ignored)
             10,                       # satellites_visible
             0,                        # yaw (0 = unknown)
@@ -116,12 +115,12 @@ def send_gps_input(conn, lat, lon, alt_msl):
         # Older pymavlink builds lack the yaw field
         conn.mav.gps_input_send(
             int(time.time() * 1e6),
-            0, ignore, week_ms, week,
+            1, ignore, week_ms, week,
             3,
             int(lat * 1e7), int(lon * 1e7), alt_msl,
             1.0, 1.5,
             0.0, 0.0, 0.0,
-            0.0, 0.0, 0.0,
+            0.0, 0.5, 0.0,
             10,
         )
 
@@ -243,9 +242,11 @@ def main():
     print(f"  Duration   :  ~{int(args.steps * 2 * args.interval)} s total")
     print(f"  GPS rate   :  {GPS_HZ} Hz (continuous injection)")
     print()
-    print("  NOTE: Pixhawk must have GPS1_TYPE = 14 (MAVLink)")
-    print("        Set via QGroundControl → Parameters → GPS1_TYPE = 14")
-    print("        Then reboot Pixhawk before running this script.")
+    print("  NOTE: Required Pixhawk parameters (set via QGroundControl):")
+    print("          GPS1_TYPE     = 1  (Auto — keep real GPS module)")
+    print("          GPS2_TYPE     = 14 (MAVLink — Jetson GPS_INPUT)")
+    print("          GPS_AUTO_SWITCH = 4 (use best/lowest hacc)")
+    print("        Reboot Pixhawk after changing parameters.")
     print("=" * 70)
     print()
     print(f"  {'Step':>5}  {'Label':<26}  {'Latitude':>13}  {'Longitude':>14}")
