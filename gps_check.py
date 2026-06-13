@@ -15,8 +15,12 @@ Usage:
 """
 
 import argparse
+import json
+import os
 import sys
 import time
+
+HOME_CACHE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "last_home.json")
 
 try:
     from pymavlink import mavutil
@@ -220,7 +224,17 @@ def main():
             print("  • Run with --loop to wait longer.")
             sys.exit(1)
 
-        print_fix(*fix)
+        lat, lon, rel_alt, alt_msl = fix
+        # Save to file so gps_sim.py can use it even after GPS1_TYPE=14
+        try:
+            with open(HOME_CACHE, "w") as f:
+                json.dump({"lat": lat, "lon": lon,
+                           "alt_msl": alt_msl, "rel_alt": rel_alt,
+                           "time": time.strftime("%Y-%m-%d %H:%M:%S")}, f, indent=2)
+            print(f"  (saved to {HOME_CACHE})")
+        except Exception:
+            pass
+        print_fix(lat, lon, rel_alt, alt_msl)
 
 
 if __name__ == "__main__":

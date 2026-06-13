@@ -20,9 +20,13 @@ Usage:
 """
 
 import argparse
+import json
 import math
+import os
 import sys
 import time
+
+HOME_CACHE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "last_home.json")
 
 try:
     from pymavlink import mavutil
@@ -122,8 +126,8 @@ def send_gps_input(conn, lat, lon, alt_msl):
         )
 
 
-def get_real_gps(conn, timeout=30):
-    """Read the real GPS from Pixhawk before we start spoofing."""
+def get_real_gps(conn, timeout=10):
+    """Try to read GPS from Pixhawk (works when GPS1_TYPE != 14)."""
     request_streams(conn)
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -135,8 +139,20 @@ def get_real_gps(conn, timeout=30):
             continue
         return (msg.lat / 1e7,
                 msg.lon / 1e7,
-                msg.alt / 1000.0)   # alt MSL in metres
+                msg.alt / 1000.0)
     return None
+
+
+def load_cached_home():
+    """Read the GPS saved by gps_check.py (last_home.json)."""
+    if not os.path.exists(HOME_CACHE):
+        return None
+    try:
+        with open(HOME_CACHE) as f:
+            d = json.load(f)
+        return d["lat"], d["lon"], d["alt_msl"]
+    except Exception:
+        return None
 
 # ── waypoint stream ───────────────────────────────────────────────────────────
 
@@ -157,14 +173,20 @@ def hold_position(conn, lat, lon, alt, seconds, label, step, total):
 def main():
     parser = argparse.ArgumentParser(
         description="Simulate GPS movement via MAVLink GPS_INPUT injection")
-    parser.add_argument("--port",     default=DEFAULT_PORT)
-    parser.add_argument("--baud",     type=int,   default=DEFAULT_BAUD)
-    parser.add_argument("--step",     type=float, default=STEP_METRES,
+    parser.add_argument("--port",      default=DEFAULT_PORT)
+    parser.add_argument("--baud",      type=int,   default=DEFAULT_BAUD)
+    parser.add_argument("--step",      type=float, default=STEP_METRES,
                         help=f"Metres per step (default {STEP_METRES})")
-    parser.add_argument("--interval", type=float, default=INTERVAL_S,
+    parser.add_argument("--interval",  type=float, default=INTERVAL_S,
                         help=f"Seconds at each waypoint (default {INTERVAL_S})")
-    parser.add_argument("--steps",    type=int,   default=STEPS_OUT,
+    parser.add_argument("--steps",     type=int,   default=STEPS_OUT,
                         help=f"Steps north (same count south, default {STEPS_OUT})")
+    parser.add_argument("--home-lat",  type=float, default=None,
+                        help="Home latitude  (override auto-detect)")
+    parser.add_argument("--home-lon",  type=float, default=None,
+                        help="Home longitude (override auto-detect)")
+    parser.add_argument("--home-alt",  type=float, default=None,
+                        help="Home altitude in metres MSL (override)")
     args = parser.parse_args()
 
     # ── connect ───────────────────────────────────────────────────────────────
@@ -176,14 +198,40 @@ def main():
         sys.exit(1)
     print(f"OK  sys={conn.target_system} comp={conn.target_component}")
 
-    # ── read home GPS (real, before spoofing starts) ──────────────────────────
-    print("Reading real GPS home position …", end=" ", flush=True)
-    home = get_real_gps(conn, timeout=30)
-    if home is None:
-        print("ERROR: no GPS fix.  Ensure Pixhawk GPS has sky view.")
-        sys.exit(1)
-    home_lat, home_lon, home_alt = home
-    print(f"OK\n")
+    # ── resolve home GPS ──────────────────────────────────────────────────────
+    # Priority: CLI args → Pixhawk live GPS → last_home.json saved by gps_check.py
+    if args.home_lat is not None and args.home_lon is not None:
+        home_lat = args.home_lat
+        home_lon = args.home_lon
+        home_alt = args.home_alt if args.home_alt is not None else 0.0
+        print(f"Home GPS       :  {home_lat:.7f}, {home_lon:.7f}  "
+              f"alt={home_alt:.1f} m  (from --home-lat/lon)\n")
+
+    else:
+        print("Reading home GPS from Pixhawk …", end=" ", flush=True)
+        home = get_real_gps(conn, timeout=10)
+
+        if home:
+            home_lat, home_lon, home_alt = home
+            print(f"OK  ({home_lat:.7f}, {home_lon:.7f})\n")
+        else:
+            print("no fix (GPS1_TYPE=14 — trying last_home.json …)", end=" ", flush=True)
+            home = load_cached_home()
+            if home:
+                home_lat, home_lon, home_alt = home
+                print(f"OK\n  loaded: {home_lat:.7f}, {home_lon:.7f}  "
+                      f"alt={home_alt:.1f} m MSL\n")
+            else:
+                print("NOT FOUND\n")
+                print("ERROR: Cannot determine home position.")
+                print()
+                print("Fix — choose one:")
+                print("  1. Run gps_check.py first (while GPS1_TYPE=1) to save home:")
+                print("       python3 gps_check.py --port /dev/ttyTHS1")
+                print()
+                print("  2. Pass coordinates directly:")
+                print("       python3 gps_sim.py --home-lat 25.0868206 --home-lon 121.6002830")
+                sys.exit(1)
 
     print("=" * 70)
     print("  GPS SIMULATION")
