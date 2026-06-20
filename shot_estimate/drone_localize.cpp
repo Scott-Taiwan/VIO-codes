@@ -3,7 +3,7 @@
  *
  * Connects to Pixhawk via MAVLink serial (default /dev/ttyTHS1).
  * Monitors relative altitude; when the drone takes off and reaches
- * TAKEOFF_ALT (50 m), captures a CSI camera frame every CAPTURE_INTERVAL
+ * TAKEOFF_ALT (30 m), captures a CSI camera frame every interval
  * seconds, runs two-phase SIFT localization against the tile index, and
  * saves each photo as:
  *   photo_obtained/{lat_real}_{lon_real}-{lat_est}_{lon_est}.png
@@ -63,9 +63,9 @@ static const char*  INDEX_DIR         = "../index";
 static const char*  TILE_DIR          = "../tiles";
 static const char*  PHOTO_DIR         = "photo_obtained";
 
-static const double TAKEOFF_ALT       = 50.0;   // m  — start capturing above this
+static const double TAKEOFF_ALT       = 30.0;   // m  — start capturing above this
 static const double MIN_CAPTURE_ALT   = 10.0;   // m  — pause below this (landing)
-static const double CAPTURE_INTERVAL  = 5.0;    // s  — between frames
+// interval is now a CLI parameter (--interval), default 5 s
 
 // ── drift-prevention parameters ───────────────────────────────────────────────
 static const int    MIN_INLIERS_SEND      = 10;    // below this RANSAC geometry is useless
@@ -85,6 +85,58 @@ static const int    CSI_FLIP          = 0;    // 0 = none, 2 = 180°
 
 static bool g_gpu_sift = false;
 static std::atomic<bool> g_shutdown{false};
+
+// ── dual-output logger (stdout + timestamped log file) ────────────────────────
+
+struct Tee {
+    std::ofstream file;
+
+    void open(const std::string& path) {
+        file.open(path, std::ios::out | std::ios::trunc);
+    }
+    void close() { if (file.is_open()) { file.flush(); file.close(); } }
+    bool is_open() const { return file.is_open(); }
+
+    template<typename T>
+    Tee& operator<<(const T& v) {
+        std::cout << v;
+        if (file.is_open()) { file << v; file.flush(); }
+        return *this;
+    }
+    // std::endl, std::flush, etc.
+    Tee& operator<<(std::ostream& (*f)(std::ostream&)) {
+        f(std::cout);
+        if (file.is_open()) { f(file); file.flush(); }
+        return *this;
+    }
+    // std::fixed, std::left, etc.
+    Tee& operator<<(std::ios_base& (*f)(std::ios_base&)) {
+        f(std::cout);
+        if (file.is_open()) f(file);
+        return *this;
+    }
+};
+static Tee g_log;
+
+// Wall-clock timestamp string for log lines
+static std::string ts()
+{
+    auto now = std::chrono::system_clock::now();
+    std::time_t t = std::chrono::system_clock::to_time_t(now);
+    struct tm tm_buf {}; localtime_r(&t, &tm_buf);
+    char buf[16]; strftime(buf, sizeof(buf), "[%H:%M:%S] ", &tm_buf);
+    return buf;
+}
+
+// yyyymmdd_HHmmss string (used for log filename)
+static std::string timestamp_tag()
+{
+    auto now = std::chrono::system_clock::now();
+    std::time_t t = std::chrono::system_clock::to_time_t(now);
+    struct tm tm_buf {}; localtime_r(&t, &tm_buf);
+    char buf[20]; strftime(buf, sizeof(buf), "%Y%m%d_%H%M%S", &tm_buf);
+    return buf;
+}
 
 // ── signal handler ────────────────────────────────────────────────────────────
 
@@ -207,6 +259,23 @@ static void validate_waypoints(const std::vector<Waypoint>& wps)
 
 
 // ── mission fetch from Pixhawk ────────────────────────────────────────────────
+
+// Ask ArduPilot to start sending GLOBAL_POSITION_INT at 4 Hz on this port.
+// Without this, stream rates on TELEM3 default to 0 and the GPS-fix wait loops forever.
+static void request_streams(int fd)
+{
+    mavlink_message_t msg;
+    uint8_t buf[MAVLINK_MAX_PACKET_LEN];
+    mavlink_msg_request_data_stream_pack(
+        1, 200, &msg,
+        1, 1,                      // target sysid / compid
+        MAV_DATA_STREAM_POSITION,  // GLOBAL_POSITION_INT
+        4,                         // 4 Hz
+        1);                        // start
+    uint16_t len = mavlink_msg_to_send_buffer(buf, &msg);
+    ::write(fd, buf, len);
+    std::cout << "[stream] Requested POSITION stream at 4 Hz.\n";
+}
 
 // Block until one HEARTBEAT is received from Pixhawk.
 static void wait_for_heartbeat(int fd)
@@ -441,7 +510,7 @@ struct MatchResult { double lat, lon; int inliers; };
 static std::optional<MatchResult> direct_match(
     const cv::Mat& query_gray,
     int cx, int cy, int zoom, const char* tile_dir,
-    int radius = 1, int min_inliers = MIN_INLIERS)
+    int radius, int min_inliers, std::string& reason)
 {
     cv::Mat composite = stitch_tiles(cx, cy, zoom, tile_dir, radius);
     cv::Mat comp_gray;
@@ -452,8 +521,14 @@ static std::optional<MatchResult> direct_match(
     detect_compute(comp_gray,  kps_c,  descs_c,  3000);
     detect_compute(query_gray, kps_q,  descs_q,  2000);
 
-    if (descs_c.empty() || (int)kps_c.size() < min_inliers) return std::nullopt;
-    if (descs_q.empty() || (int)kps_q.size() < min_inliers) return std::nullopt;
+    if (descs_c.empty() || (int)kps_c.size() < min_inliers) {
+        reason = "composite too few kp (" + std::to_string(kps_c.size()) + ")";
+        return std::nullopt;
+    }
+    if (descs_q.empty() || (int)kps_q.size() < min_inliers) {
+        reason = "query too few kp (" + std::to_string(kps_q.size()) + ")";
+        return std::nullopt;
+    }
 
     std::vector<std::vector<cv::DMatch>> raw;
 #if defined(USE_GPU)
@@ -470,7 +545,11 @@ static std::optional<MatchResult> direct_match(
     for (auto& pr : raw)
         if (pr.size() >= 2 && pr[0].distance < MATCH_RATIO * pr[1].distance)
             good.push_back(pr[0]);
-    if ((int)good.size() < min_inliers) return std::nullopt;
+    if ((int)good.size() < min_inliers) {
+        reason = "ratio-test matches " + std::to_string(good.size())
+                 + " < " + std::to_string(min_inliers);
+        return std::nullopt;
+    }
 
     std::vector<cv::Point2f> src, dst;
     for (auto& m : good) {
@@ -479,10 +558,17 @@ static std::optional<MatchResult> direct_match(
     }
     cv::Mat mask;
     cv::Mat H = cv::findHomography(src, dst, cv::RANSAC, 5.0, mask);
-    if (H.empty()) return std::nullopt;
+    if (H.empty()) {
+        reason = "homography failed (good=" + std::to_string(good.size()) + ")";
+        return std::nullopt;
+    }
 
     int inliers = cv::countNonZero(mask);
-    if (inliers < min_inliers) return std::nullopt;
+    if (inliers < min_inliers) {
+        reason = "inliers " + std::to_string(inliers)
+                 + " < " + std::to_string(min_inliers);
+        return std::nullopt;
+    }
 
     // Check convexity (rejects degenerate homographies)
     float qw = (float)query_gray.cols, qh = (float)query_gray.rows;
@@ -490,8 +576,16 @@ static std::optional<MatchResult> direct_match(
     std::vector<cv::Point2f> corners_out;
     cv::perspectiveTransform(corners_in, corners_out, H);
     float area = cv::contourArea(corners_out);
-    if (area < qw*qh*0.05f || area > qw*qh*50.0f) return std::nullopt;
-    if (!cv::isContourConvex(std::vector<cv::Point2f>(corners_out))) return std::nullopt;
+    if (area < qw*qh*0.05f || area > qw*qh*50.0f) {
+        reason = "area check failed (area=" + std::to_string((int)area)
+                 + " expected " + std::to_string((int)(qw*qh*0.05f))
+                 + ".." + std::to_string((int)(qw*qh*50.0f)) + ")";
+        return std::nullopt;
+    }
+    if (!cv::isContourConvex(std::vector<cv::Point2f>(corners_out))) {
+        reason = "non-convex homography (inliers=" + std::to_string(inliers) + ")";
+        return std::nullopt;
+    }
 
     // Project query centre → composite pixel → GPS
     std::vector<cv::Point2f> ctr_in  = {{qw/2, qh/2}};
@@ -502,7 +596,11 @@ static std::optional<MatchResult> direct_match(
     int comp_size = (2*radius+1) * TILE_SIZE;
     int margin    = TILE_SIZE;
     if (cpx < -margin || cpx > comp_size+margin ||
-        cpy < -margin || cpy > comp_size+margin) return std::nullopt;
+        cpy < -margin || cpy > comp_size+margin) {
+        reason = "centre out of bounds (cpx=" + std::to_string((int)cpx)
+                 + " cpy=" + std::to_string((int)cpy) + ")";
+        return std::nullopt;
+    }
 
     int x_orig = cx - radius, y_orig = cy - radius;
     int tile_dx = (int)(cpx / TILE_SIZE);
@@ -510,6 +608,7 @@ static std::optional<MatchResult> direct_match(
     float lpx = cpx - tile_dx * TILE_SIZE;
     float lpy = cpy - tile_dy * TILE_SIZE;
     auto [lat, lon] = pixel_to_latlon(lpx, lpy, x_orig+tile_dx, y_orig+tile_dy, zoom);
+    reason = "OK inliers=" + std::to_string(inliers);
     return MatchResult{lat, lon, inliers};
 }
 
@@ -619,7 +718,8 @@ static std::string gst_pipeline(int sensor_id, int w, int h, int fps, int flip)
 
 static std::string build_filename(double real_lat, double real_lon,
                                    double est_lat,  double est_lon,
-                                   bool has_fix, double dist_m = -1.0)
+                                   bool has_fix, double dist_m,
+                                   double real_alt)
 {
     std::ostringstream ss;
     ss << std::fixed << std::setprecision(7);
@@ -630,6 +730,8 @@ static std::string build_filename(double real_lat, double real_lon,
     } else {
         ss << "NOFIX_NOFIX__NAm";
     }
+    // append real altitude (e.g. __32.4m)
+    ss << "__" << std::setprecision(1) << real_alt << "m";
     ss << ".png";
     return ss.str();
 }
@@ -645,34 +747,52 @@ static std::optional<MatchResult> localize_frame(
     cv::Mat gray;
     cv::cvtColor(frame, gray, cv::COLOR_BGR2GRAY);
 
-    // Phase 1 — coarse FLANN vote
-    // (use CPU SIFT for the query to match the pre-built index)
+    // Phase 1 — coarse FLANN vote (CPU SIFT to match pre-built index)
     auto sift = cv::SIFT::create(2000);
     std::vector<cv::KeyPoint> kps_q;
     cv::Mat descs_q;
     sift->detectAndCompute(gray, cv::noArray(), kps_q, descs_q);
+
+    g_log << ts() << "  [P1] extracted " << kps_q.size() << " keypoints\n";
     if (descs_q.empty() || (int)kps_q.size() < 5) {
-        std::cout << "  Too few features.\n";
+        g_log << ts() << "  [P1] FAIL: too few features ("
+              << kps_q.size() << " < 5) — skip frame\n";
         return std::nullopt;
     }
-    std::cout << "  Query features: " << kps_q.size() << " kp\n";
 
     auto ranked = flann_vote(descs_q, fi);
+    g_log << ts() << "  [P1] FLANN voted on " << ranked.size() << " tile(s)\n";
     if (ranked.empty()) {
-        std::cout << "  No FLANN votes.\n";
+        g_log << ts() << "  [P1] FAIL: no tile candidates from FLANN\n";
         return std::nullopt;
     }
 
-    // Phase 2 — stitched direct match on top candidates
+    // Log top-5 candidates
+    int show = std::min((int)ranked.size(), 5);
+    g_log << ts() << "  [P1] top " << show << " candidates:\n";
+    for (int i = 0; i < show; ++i) {
+        int ti = ranked[i].first;
+        g_log << ts() << "       #" << (i+1) << " tile("
+              << index[ti].tile_x << "," << index[ti].tile_y
+              << ") votes=" << ranked[i].second << "\n";
+    }
+
+    // Phase 2 — direct match on top candidates
     int n_try = std::min((int)ranked.size(), TOP_CANDIDATES);
     for (int i = 0; i < n_try; ++i) {
         int ti = ranked[i].first;
         int cx = index[ti].tile_x, cy = index[ti].tile_y;
-        std::cout << "  Phase2: tile (" << cx << "," << cy
-                  << ") votes=" << ranked[i].second << " …\n";
-        auto res = direct_match(gray, cx, cy, zoom, TILE_DIR, 1, MIN_INLIERS);
-        if (res) return res;
+        std::string reason;
+        auto res = direct_match(gray, cx, cy, zoom, TILE_DIR, 1, MIN_INLIERS, reason);
+        if (res) {
+            g_log << ts() << "  [P2] MATCH tile(" << cx << "," << cy
+                  << ") votes=" << ranked[i].second << " — " << reason << "\n";
+            return res;
+        }
+        g_log << ts() << "  [P2] FAIL  tile(" << cx << "," << cy
+              << ") votes=" << ranked[i].second << " — " << reason << "\n";
     }
+    g_log << ts() << "  [P2] all " << n_try << " candidate(s) rejected — NOFIX\n";
     return std::nullopt;
 }
 
@@ -681,19 +801,22 @@ static std::optional<MatchResult> localize_frame(
 int main(int argc, char* argv[])
 {
     // ── parse args ────────────────────────────────────────────────────────────
-    const char* port = DEFAULT_PORT;
-    int         baud = DEFAULT_BAUD;
-    int         zoom = DEFAULT_ZOOM;
-    std::string waypoints_str;   // #4 & #5
+    const char* port    = DEFAULT_PORT;
+    int         baud    = DEFAULT_BAUD;
+    int         zoom    = DEFAULT_ZOOM;
+    double      interval = 5.0;            // seconds between photos (--interval)
+    std::string waypoints_str;
 
     for (int i = 1; i < argc; ++i) {
-        if      (!strcmp(argv[i], "--port")      && i+1 < argc) port = argv[++i];
-        else if (!strcmp(argv[i], "--baud")      && i+1 < argc) baud = std::stoi(argv[++i]);
-        else if (!strcmp(argv[i], "--zoom")      && i+1 < argc) zoom = std::stoi(argv[++i]);
+        if      (!strcmp(argv[i], "--port")      && i+1 < argc) port     = argv[++i];
+        else if (!strcmp(argv[i], "--baud")      && i+1 < argc) baud     = std::stoi(argv[++i]);
+        else if (!strcmp(argv[i], "--zoom")      && i+1 < argc) zoom     = std::stoi(argv[++i]);
+        else if (!strcmp(argv[i], "--interval")  && i+1 < argc) interval = std::stod(argv[++i]);
         else if (!strcmp(argv[i], "--waypoints") && i+1 < argc) waypoints_str = argv[++i];
         else {
             std::cerr << "Usage: " << argv[0]
                       << " [--port /dev/ttyTHS1] [--baud 57600] [--zoom 18]\n"
+                      << "       [--interval 5]  (seconds between photos, default 5)\n"
                       << "       [--waypoints \"lat1,lon1 lat2,lon2 ...\"]\n"
                       << "  Mission waypoints are auto-fetched from Pixhawk at startup.\n"
                       << "  --waypoints overrides the auto-fetch.\n";
@@ -704,6 +827,20 @@ int main(int argc, char* argv[])
     // ── signal handlers ───────────────────────────────────────────────────────
     signal(SIGINT,  handle_signal);
     signal(SIGTERM, handle_signal);
+
+    // ── open log file (same dir as executable, named by start timestamp) ─────
+    {
+        char exe_path[4096] = {};
+        ssize_t len = readlink("/proc/self/exe", exe_path, sizeof(exe_path)-1);
+        std::string exe_dir = (len > 0)
+            ? fs::path(exe_path).parent_path().string() : ".";
+        std::string log_path = exe_dir + "/" + timestamp_tag() + ".log";
+        g_log.open(log_path);
+        g_log << "=== drone_localize " << timestamp_tag() << " ===\n";
+        g_log << "port=" << port << " baud=" << baud
+              << " zoom=" << zoom << " interval=" << interval << "s\n\n";
+        std::cout << "Log file       : " << log_path << "\n";
+    }
 
     // ── create photo output directory ─────────────────────────────────────────
     fs::create_directories(PHOTO_DIR);
@@ -790,6 +927,9 @@ int main(int argc, char* argv[])
                   << waypoints.size() << " point(s)).\n";
     }
 
+    // Ask Pixhawk to start streaming position data on this port
+    request_streams(serial_fd);
+
     // ── start MAVLink reader thread ───────────────────────────────────────────
     VehicleState state;
     std::thread mav_thread(mavlink_reader, serial_fd, std::ref(state));
@@ -803,6 +943,12 @@ int main(int argc, char* argv[])
         std::cout << "." << std::flush;
     }
     std::cout << " ok.\n";
+    {
+        auto s = state.snapshot();
+        g_log << ts() << "[startup] GPS fix: lat=" << std::fixed << std::setprecision(7)
+              << s.lat << " lon=" << s.lon
+              << " alt=" << std::setprecision(1) << s.alt_m << " m\n";
+    }
 
     // ── open CSI camera ───────────────────────────────────────────────────────
     std::string pipeline = gst_pipeline(CSI_SENSOR_ID, CSI_WIDTH, CSI_HEIGHT,
@@ -832,18 +978,22 @@ int main(int argc, char* argv[])
 
         // takeoff detection
         if (was_on_ground && alt >= TAKEOFF_ALT) {
-            std::cout << "\nTakeoff confirmed — altitude " << std::fixed
-                      << std::setprecision(1) << alt << " m.  "
-                      << "Starting capture every " << CAPTURE_INTERVAL << " s.\n";
+            g_log << ts() << "Takeoff confirmed — alt=" << std::fixed
+                  << std::setprecision(1) << alt << " m  lat=" << std::setprecision(7)
+                  << lat << " lon=" << lon
+                  << "  capture every " << interval << " s\n";
             capturing_active = true;
             was_on_ground    = false;
         }
 
         // landing detection
         if (alt < MIN_CAPTURE_ALT) {
-            if (capturing_active)
-                std::cout << "\nAltitude " << alt << " m < " << MIN_CAPTURE_ALT
-                          << " m — capture paused (landing).\n";
+            if (capturing_active) {
+                g_log << ts() << "Landing detected — alt=" << std::fixed
+                      << std::setprecision(1) << alt << " m < " << MIN_CAPTURE_ALT
+                      << " m — capture paused, closing log.\n";
+                g_log.close();
+            }
             capturing_active = false;
             was_on_ground    = true;
         }
@@ -852,29 +1002,31 @@ int main(int argc, char* argv[])
         auto now = std::chrono::steady_clock::now();
         double elapsed_s = std::chrono::duration<double>(now - last_capture).count();
 
-        if (capturing_active && elapsed_s >= CAPTURE_INTERVAL) {
+        if (capturing_active && elapsed_s >= interval) {
             last_capture = now;
-            std::cout << "\n" << std::string(55, '-') << "\n";
-            std::cout << "Capture — alt=" << std::fixed << std::setprecision(1)
-                      << alt << " m\n";
+            g_log << "\n" << ts() << std::string(50, '-') << "\n";
 
-            // get fresh GPS snapshot right before the shot
+            // fresh GPS snapshot right before the shot
             auto [snap_alt, real_lat, real_lon, snap_ok] = state.snapshot();
+            g_log << ts() << "Capture — alt=" << std::fixed << std::setprecision(1)
+                  << snap_alt << " m  GPS=" << std::setprecision(7)
+                  << real_lat << "," << real_lon;
             if (!snap_ok) {
-                std::cout << "  No GPS fix — skipping.\n";
+                g_log << "  [NO GPS FIX — skip]\n";
                 continue;
             }
-            std::cout << "  Real GPS : " << std::setprecision(7)
-                      << real_lat << ", " << real_lon << "\n";
+            g_log << "\n";
 
             // grab frame
             cv::Mat frame;
             if (!cap.read(frame) || frame.empty()) {
-                std::cerr << "  Camera read failed — skipping.\n";
+                g_log << ts() << "  [CAMERA READ FAILED — skip]\n";
                 continue;
             }
+            g_log << ts() << "  Frame: " << frame.cols << "x" << frame.rows << "\n";
 
             // SIFT localization
+            g_log << ts() << "  Starting SIFT localization …\n";
             auto result = localize_frame(frame, index, fi, zoom);
 
             bool has_fix = result.has_value();
@@ -883,43 +1035,29 @@ int main(int argc, char* argv[])
                 est_lat = result->lat;
                 est_lon = result->lon;
                 dist_m  = haversine_m(real_lat, real_lon, est_lat, est_lon);
-                std::cout << "  Est. GPS : " << std::setprecision(7)
-                          << est_lat << ", " << est_lon << "\n";
-                std::cout << "  Inliers  : " << result->inliers
-                          << "   Distance: " << std::setprecision(1) << dist_m << " m\n";
+                g_log << ts() << "  SIFT result: lat=" << std::setprecision(7)
+                      << est_lat << " lon=" << est_lon
+                      << " inliers=" << result->inliers
+                      << " dist=" << std::setprecision(1) << dist_m << " m\n";
             } else {
-                std::cout << "  Est. GPS : NOFIX\n";
+                g_log << ts() << "  SIFT result: NOFIX\n";
             }
 
-            // ── send fix to Pixhawk (hacc expresses confidence to EKF) ──────
-            if (has_fix && result->inliers >= MIN_INLIERS_SEND) {
-                float hacc = hacc_from_inliers(result->inliers);
-                std::cout << "  → GPS_INPUT: ("
-                          << std::setprecision(7) << est_lat << ", " << est_lon << ")"
-                          << "  inliers=" << result->inliers
-                          << "  hacc=" << std::setprecision(1) << hacc << " m\n";
-                send_gps_input(serial_fd, est_lat, est_lon, hacc);
-            } else if (has_fix) {
-                std::cout << "  → inliers=" << result->inliers
-                          << " < " << MIN_INLIERS_SEND
-                          << " — geometry unreliable, not sent; Pixhawk uses IMU\n";
-            } else {
-                std::cout << "  → NOFIX — not sent; Pixhawk uses IMU\n";
-            }
-
-            // save photo
+            // save photo (filename includes real alt at end)
             std::string fname = build_filename(real_lat, real_lon,
-                                               est_lat, est_lon, has_fix, dist_m);
+                                               est_lat, est_lon, has_fix,
+                                               dist_m, snap_alt);
             std::string fpath = std::string(PHOTO_DIR) + "/" + fname;
             cv::imwrite(fpath, frame);
-            std::cout << "  Saved    : " << fpath << "\n";
+            g_log << ts() << "  Saved: " << fpath << "\n";
         }
 
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
 
     // ── cleanup ───────────────────────────────────────────────────────────────
-    std::cout << "\nShutting down …\n";
+    g_log << "\n" << ts() << "=== shutdown ===\n";
+    g_log.close();
     cap.release();
     mav_thread.join();
     close(serial_fd);

@@ -18,7 +18,7 @@ PHOTO_OUTDIR  := photo_obtained
 
 # ── compiler ──────────────────────────────────────────────────────────────────
 CXX    := g++
-NVCC   := nvcc
+NVCC   := /usr/local/cuda/bin/nvcc
 
 CXXSTD := -std=c++17
 OPTFLG := -O2
@@ -64,7 +64,7 @@ NVCC_FLAGS    := -std=c++17 -O2 -arch=$(CUDA_ARCH) \
 LDFLAGS_GPU   := $(OPENCV_LIBS) -lpthread \
                  -L$(POPSIFT_DIR)/lib \
                  -Wl,-rpath,$(POPSIFT_DIR)/lib \
-                 -lPopSift \
+                 -lpopsift \
                  -L/usr/local/cuda/lib64 \
                  -lcudart -lcublas
 

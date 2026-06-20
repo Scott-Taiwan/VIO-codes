@@ -11,3 +11,19 @@ python build_index.py
 # 4 — identify a photo
 python localize.py your_photo.jpg
 python localize.py your_photo.jpg --show   # also draws the match on the tile
+
+# 5 - convert to C++ bin
+convert it to C++ usable bin
+
+cd /home/scott/claude-project/gpsless_mapping
+python3 convert_index.py
+
+or
+
+python3 convert_index.py --input index/sift_index_z19.pkl --output index/sift_index_z19.bin
+
+# 6  test photo
+
+cd /home/scott/claude-project/gpsless_mapping
+./build/localize test_photo.jpg --zoom 19
+
