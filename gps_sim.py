@@ -77,17 +77,16 @@ def request_streams(conn):
         mavutil.mavlink.MAV_DATA_STREAM_ALL, 2, 1)
 
 
-def send_gps_input(conn, lat, lon, alt_msl):
+def send_gps_input(conn, lat, lon, alt_msl, vn=0.0, ve=0.0):
     """
     Inject a GPS fix into Pixhawk via GPS_INPUT (MAVLink id 232).
-    Pixhawk must have GPS1_TYPE = 14 to accept and use this message.
-    Sending at 5 Hz keeps ArduPilot's GPS healthy without timing out.
+    vn/ve: velocity north/east in m/s — sending these helps the EKF accept
+    position changes immediately instead of waiting for large accumulated offsets.
     """
     week, week_ms = gps_week_ms()
 
-    # Ignore only velocity — send position + hacc so GPS_AUTO_SWITCH=4 can compare
-    ignore = (mavutil.mavlink.GPS_INPUT_IGNORE_FLAG_VEL_HORIZ      |
-              mavutil.mavlink.GPS_INPUT_IGNORE_FLAG_VEL_VERT       |
+    # Send position + velocity + hacc; ignore only vertical velocity and accuracy
+    ignore = (mavutil.mavlink.GPS_INPUT_IGNORE_FLAG_VEL_VERT       |
               mavutil.mavlink.GPS_INPUT_IGNORE_FLAG_SPEED_ACCURACY |
               mavutil.mavlink.GPS_INPUT_IGNORE_FLAG_VERTICAL_ACCURACY)
 
@@ -104,9 +103,9 @@ def send_gps_input(conn, lat, lon, alt_msl):
             alt_msl,                  # alt  (m, MSL)
             1.0,                      # hdop
             1.5,                      # vdop
-            0.0, 0.0, 0.0,           # vn, ve, vd  (ignored)
-            0.0,                      # speed_accuracy  (ignored)
-            0.5,                      # horiz_accuracy 0.5 m — always beats real GPS, GPS2 wins
+            vn, ve, 0.0,             # vn, ve, vd  (m/s) — EKF uses these immediately
+            0.3,                      # speed_accuracy (m/s)
+            0.5,                      # horiz_accuracy 0.5 m — beats real GPS, GPS2 wins
             0.0,                      # vert_accuracy   (ignored)
             10,                       # satellites_visible
             0,                        # yaw (0 = unknown)
@@ -119,8 +118,8 @@ def send_gps_input(conn, lat, lon, alt_msl):
             3,
             int(lat * 1e7), int(lon * 1e7), alt_msl,
             1.0, 1.5,
-            0.0, 0.0, 0.0,
-            0.0, 0.5, 0.0,
+            vn, ve, 0.0,
+            0.3, 0.5, 0.0,
             10,
         )
 
@@ -155,17 +154,32 @@ def load_cached_home():
 
 # ── waypoint stream ───────────────────────────────────────────────────────────
 
-def hold_position(conn, lat, lon, alt, seconds, label, step, total):
+def move_to(conn, lat_from, lon_from, lat_to, lon_to, alt, seconds, label, step, total):
     """
-    Send GPS_INPUT at GPS_HZ for `seconds`, then print a status line.
+    Smoothly interpolate position from (lat_from, lon_from) to (lat_to, lon_to)
+    over `seconds` at GPS_HZ. Position and velocity are always consistent so the
+    EKF tracks every step immediately without accumulation delays.
     """
-    dt       = 1.0 / GPS_HZ
-    end_time = time.time() + seconds
-    while time.time() < end_time:
-        send_gps_input(conn, lat, lon, alt)
+    dt      = 1.0 / GPS_HZ
+    n_ticks = max(1, int(seconds * GPS_HZ))
+
+    # Constant velocity throughout the move (m/s)
+    north_m = (lat_to - lat_from) * 111111.0
+    east_m  = (lon_to - lon_from) * (111111.0 * math.cos(math.radians(lat_from)))
+    vn = north_m / seconds
+    ve = east_m  / seconds
+
+    for i in range(n_ticks):
+        frac = i / n_ticks
+        lat  = lat_from + (lat_to - lat_from) * frac
+        lon  = lon_from + (lon_to - lon_from) * frac
+        send_gps_input(conn, lat, lon, alt, vn, ve)
         time.sleep(dt)
-    print(f"  {step:>3}/{total}  {label:<26}  {lat:.7f}  {lon:.7f}"
-          f"  {maps_url(lat, lon)}")
+
+    # Arrive: send final position with zero velocity
+    send_gps_input(conn, lat_to, lon_to, alt, 0.0, 0.0)
+    print(f"  {step:>3}/{total}  {label:<26}  {lat_to:.7f}  {lon_to:.7f}"
+          f"  {maps_url(lat_to, lon_to)}")
 
 # ── main ─────────────────────────────────────────────────────────────────────
 
@@ -271,9 +285,12 @@ def main():
     total = len(waypoints)
 
     # ── run simulation ────────────────────────────────────────────────────────
+    prev_lat, prev_lon = home_lat, home_lon
     try:
         for idx, (lat, lon, alt, label) in enumerate(waypoints, 1):
-            hold_position(conn, lat, lon, alt, args.interval, label, idx, total)
+            move_to(conn, prev_lat, prev_lon, lat, lon, alt,
+                    args.interval, label, idx, total)
+            prev_lat, prev_lon = lat, lon
 
     except KeyboardInterrupt:
         print("\n\nStopped by user — restoring real GPS position …")
