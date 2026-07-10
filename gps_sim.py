@@ -77,11 +77,16 @@ def request_streams(conn):
         mavutil.mavlink.MAV_DATA_STREAM_ALL, 2, 1)
 
 
-def send_gps_input(conn, lat, lon, alt_msl, vn=0.0, ve=0.0):
+def send_gps_input(conn, lat, lon, alt_msl, vn=0.0, ve=0.0, hacc=0.5):
     """
     Inject a GPS fix into Pixhawk via GPS_INPUT (MAVLink id 232).
     vn/ve: velocity north/east in m/s — sending these helps the EKF accept
     position changes immediately instead of waiting for large accumulated offsets.
+    hacc: horizontal accuracy in metres. Defaults to 0.5 (this script's own
+    simulated fixes are exact). Callers driving this from a real estimator —
+    e.g. gpsless_VO_image's dead_reckoning.PositionTracker — should pass its
+    actual hacc_m instead, so GPS_AUTO_SWITCH can tell a confident fix from a
+    drifting dead-reckoned guess.
     """
     week, week_ms = gps_week_ms()
 
@@ -105,7 +110,7 @@ def send_gps_input(conn, lat, lon, alt_msl, vn=0.0, ve=0.0):
             1.5,                      # vdop
             vn, ve, 0.0,             # vn, ve, vd  (m/s) — EKF uses these immediately
             0.3,                      # speed_accuracy (m/s)
-            0.5,                      # horiz_accuracy 0.5 m — beats real GPS, GPS2 wins
+            hacc,                     # horiz_accuracy (m) — lower wins under GPS_AUTO_SWITCH
             0.0,                      # vert_accuracy   (ignored)
             10,                       # satellites_visible
             0,                        # yaw (0 = unknown)
@@ -119,7 +124,7 @@ def send_gps_input(conn, lat, lon, alt_msl, vn=0.0, ve=0.0):
             int(lat * 1e7), int(lon * 1e7), alt_msl,
             1.0, 1.5,
             vn, ve, 0.0,
-            0.3, 0.5, 0.0,
+            0.3, hacc, 0.0,
             10,
         )
 

@@ -39,3 +39,23 @@ MIN_INLIERS = 12           # below this, the pair's displacement is unreliable
 # small fraction of matches actually agree. Same guard used in the sibling
 # gpsless_superpoint project for the same reason.
 MIN_INLIER_RATIO = 0.30
+
+# ── Dead reckoning / MAVLink GPS_INPUT bridge ────────────────────────────────
+# Compass heading (deg, clockwise from North) that the CAMERA's "image up"
+# direction points toward when the airframe heading is 0. Leave at 0 if the
+# camera is mounted with image-up = nose-forward; adjust if the CSI camera
+# is physically rotated relative to the airframe (common on compact mounts).
+CAMERA_MOUNT_YAW_OFFSET_DEG = 0.0
+
+ANCHOR_HACC_M = 0.5   # accuracy assumed for a fresh absolute fix (tile-match / GPS)
+HACC_MAX_M = 50.0     # cap — beyond this, just admit the estimate is lost
+
+# Heuristic dead-reckoning error growth — NOT a calibrated error model, just
+# a starting point. Tune against real flight logs once you have some: fly a
+# route with real GPS logging alongside GPS1_TYPE left at 1 (auto), compare
+# the injected GPS2 track to truth, and adjust these until hacc growth
+# roughly tracks actual drift.
+HACC_GROWTH_FRACTION_CONFIDENT = 0.15   # fraction of leg magnitude added (in quadrature) per confident leg
+HACC_GROWTH_FRACTION_LOW_CONF = 0.6     # same, but for low-confidence legs
+HACC_PENALTY_LOW_CONFIDENCE_M = 2.0     # flat penalty on top, for a low-confidence leg
+HACC_PENALTY_NO_MATCH_M = 5.0           # flat penalty when a pair fails outright (zero displacement info)
