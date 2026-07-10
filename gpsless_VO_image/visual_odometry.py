@@ -179,14 +179,20 @@ def process_pair(path1, path2, alt1, alt2):
     img2 = cv2.imread(path2, cv2.IMREAD_GRAYSCALE)
     if img1 is None or img2 is None:
         raise FileNotFoundError(f"could not read {path1} or {path2}")
+    result = process_pair_arrays(img1, img2, alt1, alt2)
+    result['from'], result['to'] = path1, path2
+    return result
 
-    pts1, pts2 = detect_and_match(img1, img2)
+
+def process_pair_arrays(gray1, gray2, alt1, alt2):
+    """Same as process_pair(), but on already-decoded grayscale arrays —
+    used by the live capture loop, which never round-trips frames to disk."""
+    pts1, pts2 = detect_and_match(gray1, gray2)
     M, inliers = estimate_similarity(pts1, pts2)
 
     n_matches = len(pts1)
     n_inliers = int(inliers.sum()) if inliers is not None else 0
     result = {
-        'from': path1, 'to': path2,
         'n_matches': n_matches,
         'n_inliers': n_inliers,
         'ok': False,
