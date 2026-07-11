@@ -253,8 +253,13 @@ def main():
                         cur_alt_agl = pos[3]
 
                 if args.save_dir:
+                    # Double-underscore "__live__NNm" tag matches
+                    # visual_odometry.FILENAME_ALT_RE, so replaying this
+                    # folder through visual_odometry.py auto-parses the
+                    # altitude instead of silently falling back to
+                    # config.REFERENCE_ALTITUDE_M (60m).
                     ts = datetime.now().strftime('%Y%m%d_%H%M%S')
-                    cv2.imwrite(os.path.join(args.save_dir, f"{ts}_{cur_alt_agl:.1f}m.jpg"), frame)
+                    cv2.imwrite(os.path.join(args.save_dir, f"{ts}__live__{cur_alt_agl:.1f}m.jpg"), frame)
 
                 # Detect this frame's features once and cache them — the next
                 # loop iteration reuses them as "frame 1" instead of paying
