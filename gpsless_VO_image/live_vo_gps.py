@@ -22,9 +22,15 @@ altitude with the ~70x55 m footprint in config.py, keeping displacement per
 leg under roughly 20 m is a reasonable starting target.
 
 Usage:
-    # Handheld ground test — no flight, no Pixhawk needed. Hand-carry the
-    # frame and walk around; see --handheld below. REMOVE PROPELLERS FIRST.
-    python3 live_vo_gps.py --handheld --interval 1 --save-dir ./handheld_test
+    # Handheld ground test, fully offline (no Pixhawk at all).
+    # REMOVE PROPELLERS FIRST.
+    python3 live_vo_gps.py --handheld --dry-run --interval 1 --save-dir ./handheld_test
+
+    # Handheld ground test with the F450 powered on and wired to the Jetson,
+    # so the real compass heading (and GPS fix, if any) gets used as the
+    # anchor instead of a dummy one. Connecting and sending GPS_INPUT never
+    # arms the vehicle or moves the motors either way. REMOVE PROPELLERS FIRST.
+    python3 live_vo_gps.py --handheld --port /dev/ttyTHS1 --interval 1 --save-dir ./handheld_test
 
     # Camera + VO only, no Pixhawk needed at all:
     python3 live_vo_gps.py --dry-run --interval 2 --altitude 60
@@ -140,10 +146,19 @@ def resolve_anchor(conn, args):
             alt_msl = alt_msl if alt_msl is not None else cached[2]
 
     if lat is None or lon is None or alt_msl is None or heading is None:
-        raise SystemExit(
-            "Could not resolve an anchor position/heading. Provide --anchor-lat/--anchor-lon/"
-            "--anchor-alt/--anchor-heading explicitly, or connect to a Pixhawk that has a fix."
-        )
+        if args.handheld:
+            print("WARNING: --handheld could not resolve a real anchor from Pixhawk/cache -- "
+                  "falling back to a dummy anchor (missing fields default to 0). Ignore the "
+                  "printed lat/lon; only displacement/yaw/confidence matter for this test.")
+            lat = lat if lat is not None else 0.0
+            lon = lon if lon is not None else 0.0
+            alt_msl = alt_msl if alt_msl is not None else 0.0
+            heading = heading if heading is not None else 0.0
+        else:
+            raise SystemExit(
+                "Could not resolve an anchor position/heading. Provide --anchor-lat/--anchor-lon/"
+                "--anchor-alt/--anchor-heading explicitly, or connect to a Pixhawk that has a fix."
+            )
     if alt_agl is None:
         alt_agl = config.REFERENCE_ALTITUDE_M
         print(f"WARNING: no AGL altitude available — defaulting to {alt_agl}m for GSD scaling. "
@@ -171,29 +186,28 @@ def main():
     ap.add_argument('--dry-run', action='store_true', help="don't connect to Pixhawk, just print")
     ap.add_argument('--handheld', action='store_true',
                      help='ground/bench test: hand-carry the frame to exercise capture+VO without '
-                          'flying or a Pixhawk connection. Implies --dry-run, fills in a dummy anchor '
-                          '(0,0,0,0) if none given, and defaults --altitude to 1.5m (a hand-held height '
-                          'instead of the 60m flight default -- the IMX219 is fixed-focus and may blur '
-                          'much closer than that). REMOVE PROPELLERS BEFORE HANDLING THE FRAME.')
+                          'flying. Defaults --altitude to 1.5m (hand-held height, not the 60m '
+                          'flight default -- the IMX219 is fixed-focus and may blur much closer '
+                          'than that). Anchor: uses real Pixhawk telemetry if connected (pass '
+                          '--port, omit --dry-run) so the true compass heading gets used; falls '
+                          'back to a dummy anchor (0,0,0,0) instead of erroring out if none is '
+                          'available. REMOVE PROPELLERS BEFORE HANDLING THE FRAME, whether or not '
+                          'the flight controller is powered.')
     args = ap.parse_args()
 
     if args.handheld:
-        args.dry_run = True
         if args.altitude is None:
             args.altitude = 1.5
-        if args.anchor_lat is None:
-            args.anchor_lat = 0.0
-        if args.anchor_lon is None:
-            args.anchor_lon = 0.0
-        if args.anchor_alt is None:
-            args.anchor_alt = 0.0
-        if args.anchor_heading is None:
-            args.anchor_heading = 0.0
         print("=" * 70)
-        print("HANDHELD TEST MODE -- no flight, no Pixhawk connection.")
-        print("SAFETY: propellers must be removed before handling the frame.")
-        print("Anchor lat/lon below is a dummy (0, 0) -- ignore it; only the")
-        print("displacement/yaw/confidence and estimated track shape matter here.")
+        print("HANDHELD TEST MODE -- ground test, not a real flight.")
+        print("SAFETY: propellers must be removed before handling the frame,")
+        print("whether or not the flight controller is powered on.")
+        if args.dry_run:
+            print("No Pixhawk connection (--dry-run) -- using a dummy anchor.")
+        else:
+            print("Connecting to Pixhawk for a real compass heading/GPS fix if available")
+            print("(connecting and sending GPS_INPUT never arms the vehicle or moves the")
+            print("motors) -- falls back to a dummy anchor if no fix is available.")
         print("=" * 70)
         print()
 
