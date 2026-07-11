@@ -22,6 +22,10 @@ altitude with the ~70x55 m footprint in config.py, keeping displacement per
 leg under roughly 20 m is a reasonable starting target.
 
 Usage:
+    # Handheld ground test — no flight, no Pixhawk needed. Hand-carry the
+    # frame and walk around; see --handheld below. REMOVE PROPELLERS FIRST.
+    python3 live_vo_gps.py --handheld --interval 1 --save-dir ./handheld_test
+
     # Camera + VO only, no Pixhawk needed at all:
     python3 live_vo_gps.py --dry-run --interval 2 --altitude 60
 
@@ -165,7 +169,33 @@ def main():
     ap.add_argument('--sensor-id', type=int, default=0)
     ap.add_argument('--save-dir', default=None, help='optionally save every captured frame here')
     ap.add_argument('--dry-run', action='store_true', help="don't connect to Pixhawk, just print")
+    ap.add_argument('--handheld', action='store_true',
+                     help='ground/bench test: hand-carry the frame to exercise capture+VO without '
+                          'flying or a Pixhawk connection. Implies --dry-run, fills in a dummy anchor '
+                          '(0,0,0,0) if none given, and defaults --altitude to 1.5m (a hand-held height '
+                          'instead of the 60m flight default -- the IMX219 is fixed-focus and may blur '
+                          'much closer than that). REMOVE PROPELLERS BEFORE HANDLING THE FRAME.')
     args = ap.parse_args()
+
+    if args.handheld:
+        args.dry_run = True
+        if args.altitude is None:
+            args.altitude = 1.5
+        if args.anchor_lat is None:
+            args.anchor_lat = 0.0
+        if args.anchor_lon is None:
+            args.anchor_lon = 0.0
+        if args.anchor_alt is None:
+            args.anchor_alt = 0.0
+        if args.anchor_heading is None:
+            args.anchor_heading = 0.0
+        print("=" * 70)
+        print("HANDHELD TEST MODE -- no flight, no Pixhawk connection.")
+        print("SAFETY: propellers must be removed before handling the frame.")
+        print("Anchor lat/lon below is a dummy (0, 0) -- ignore it; only the")
+        print("displacement/yaw/confidence and estimated track shape matter here.")
+        print("=" * 70)
+        print()
 
     if args.save_dir:
         os.makedirs(args.save_dir, exist_ok=True)
@@ -190,7 +220,7 @@ def main():
     cap = open_camera(args.sensor_id)
     print("Camera open. Ctrl+C to stop.\n")
 
-    prev_gray, prev_time, prev_alt_agl = None, None, alt_agl
+    prev_feat, prev_time, prev_alt_agl = None, None, alt_agl
     vn, ve = 0.0, 0.0
     n_frame = 0
 
@@ -202,24 +232,34 @@ def main():
             if frame is None:
                 print("WARNING: frame grab failed, skipping")
             else:
-                if args.save_dir:
-                    ts = datetime.now().strftime('%Y%m%d_%H%M%S')
-                    cv2.imwrite(os.path.join(args.save_dir, f"{ts}_{prev_alt_agl:.1f}m.jpg"), frame)
-
                 cur_alt_agl = alt_agl
                 if conn is not None:
                     pos = read_global_position(conn, timeout=0.2)
                     if pos:
                         cur_alt_agl = pos[3]
 
-                if prev_gray is not None:
-                    r = vo.process_pair_arrays(prev_gray, gray, prev_alt_agl, cur_alt_agl)
+                if args.save_dir:
+                    ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+                    cv2.imwrite(os.path.join(args.save_dir, f"{ts}_{cur_alt_agl:.1f}m.jpg"), frame)
+
+                # Detect this frame's features once and cache them — the next
+                # loop iteration reuses them as "frame 1" instead of paying
+                # for detection on the same frame twice.
+                t_detect = time.time()
+                feat = vo.detect_features(gray)
+                detect_ms = (time.time() - t_detect) * 1000.0
+
+                if prev_feat is not None:
+                    t_match = time.time()
+                    r = vo.process_pair_features(prev_feat, feat, prev_alt_agl, cur_alt_agl)
+                    match_ms = (time.time() - t_match) * 1000.0
                     dt_s = now - prev_time
                     state = tracker.apply_leg(r, dt_s=dt_s)
                     vn, ve = state['vn'], state['ve']
 
                     tag = "OK  " if r.get('confident') else ("FAIL" if not r['ok'] else "LOW-CONF")
-                    print(f"[frame {n_frame}] [{tag}] dt={dt_s:.2f}s", end='  ')
+                    print(f"[frame {n_frame}] [{tag}] dt={dt_s:.2f}s "
+                          f"detect={detect_ms:.0f}ms match={match_ms:.0f}ms", end='  ')
                     if r['ok']:
                         print(f"disp={r['magnitude_m']:.2f}m yaw={r['yaw_change_deg']:+.2f}deg", end='  ')
                     else:
@@ -228,7 +268,7 @@ def main():
                           f"hacc={state['hacc_m']:.2f}m")
                     print(f"          {maps_url(state['lat'], state['lon'])}")
 
-                prev_gray, prev_time, prev_alt_agl = gray, now, cur_alt_agl
+                prev_feat, prev_time, prev_alt_agl = feat, now, cur_alt_agl
 
             # Resend the current best estimate at gps_hz until the next capture,
             # so Pixhawk doesn't consider GPS2 stale between photos.

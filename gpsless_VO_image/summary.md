@@ -39,6 +39,25 @@
 
 **已在真實硬體上驗證**（這台開發機本身就是裝在 F450 上的 Jetson Orin Nano）：相機能正常開啟並拍到真實影像，`--dry-run` 模式下整條「拍照→VO→dead-reckoning」的流程跑起來沒有錯誤，靜止拍攝時正確回報位移趨近於 0／`too few inliers`。**尚未實測**：真的接上通電的 Pixhawk、送出 `GPS_INPUT` 並在 Mission Planner 上確認 GPS2 有更新。
 
+### 手持測試（不用飛行）
+
+不想每次都真的把 F450 飛起來才能測「連續拍照→VO」這條流程，可以直接手持機身走動測試：
+
+```bash
+# 先拆掉螺旋槳！人拿在手上移動，萬一不小心解鎖(arm)不會傷到人。
+python3 live_vo_gps.py --handheld --interval 1 --save-dir ./handheld_test
+```
+
+`--handheld` 會自動做這幾件事：
+- 強制 `--dry-run`（不連 Pixhawk，也不需要飛控通電）
+- 沒指定 `--altitude` 時預設用 1.5m（手持高度），不是空拍用的 60m —— IMX219 是定焦鏡頭，太近（大約 1m 以內）可能會失焦模糊，手持時建議鏡頭離地至少 1m 以上（例如像端托盤一樣舉在胸前往下拍）
+- 沒指定錨點時用假值 `(0, 0, 0, 0)` 頂著跑，畫面上印出來的經緯度可以忽略，重點看 `disp=`／`yaw=`／信心標記（OK／LOW-CONF）
+- 地面要挑有紋理的（柏油、草地、地毯花紋、磁磚接縫），避免對著單色地板/桌面，SIFT/ORB 才找得到足夠特徵點
+
+`--save-dir` 建議加上，把每張照片存下來，之後可以直接用 `visual_odometry.py`／`vo_gps_bridge.py` 對這批照片重新分析、畫軌跡，比看即時 log 更方便除錯。
+
+人走路速度比飛行慢很多，同樣 `--interval` 秒數下重疊度會高很多——這正好可以驗證前面「拍照間隔要夠密才準」這個結論：可以事先用皮尺量一段已知直線距離，事後跟程式估算的軌跡比對誤差。
+
 ### 意外發現的環境問題
 
 `~/.local/lib/python3.10/site-packages` 裡有一個 pip 裝的 `opencv-python`（4.13.0，無 GStreamer），蓋掉了 JetPack 系統內建、有 GStreamer 支援的 OpenCV（`/usr/lib/python3/dist-packages`，4.5.4）。實測確認 **`gpsless_mapping/capture_sample.py` 目前因此無法開啟相機**（`ERROR: Could not open CSI camera`）。`live_vo_gps.py` 用「import cv2 前先把系統路徑插到最前面」繞過去了，但根本問題還沒解決——建議之後把 `~/.local` 那個 opencv-python 移除（前提是沒有其他東西真的需要 4.13 版的特定功能）。

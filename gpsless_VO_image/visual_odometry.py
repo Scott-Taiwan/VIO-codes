@@ -91,25 +91,41 @@ def _central_crop(gray):
     return gray[y0:y0 + ch, x0:x0 + cw], (x0, y0)
 
 
+def _matcher_norm():
+    return cv2.NORM_HAMMING if config.DETECTOR == 'orb' else cv2.NORM_L2
+
+
 def _make_detector():
     if config.DETECTOR == 'orb':
-        return cv2.ORB_create(nfeatures=config.ORB_N_FEATURES), cv2.NORM_HAMMING
-    return cv2.SIFT_create(nfeatures=config.SIFT_N_FEATURES), cv2.NORM_L2
+        return cv2.ORB_create(nfeatures=config.ORB_N_FEATURES)
+    return cv2.SIFT_create(nfeatures=config.SIFT_N_FEATURES)
 
 
-def detect_and_match(gray1, gray2):
-    """Returns matched point pairs (Nx2 arrays, in ORIGINAL full-frame pixel
-    coordinates) after Lowe's ratio test."""
-    crop1, off1 = _central_crop(gray1)
-    crop2, off2 = _central_crop(gray2)
+def detect_features(gray):
+    """Detect keypoints/descriptors on a central crop of a single frame.
 
-    detector, norm = _make_detector()
-    kp1, des1 = detector.detectAndCompute(crop1, None)
-    kp2, des2 = detector.detectAndCompute(crop2, None)
+    Returns (keypoints, descriptors, crop_offset). Split out from
+    detect_and_match() so a caller stepping through a video stream (e.g.
+    live_vo_gps.py) can cache one frame's features and reuse them as frame 1
+    of the next pair, instead of re-running detection on the same frame
+    twice.
+    """
+    crop, off = _central_crop(gray)
+    detector = _make_detector()
+    kp, des = detector.detectAndCompute(crop, None)
+    return kp, des, off
+
+
+def match_features(feat1, feat2):
+    """Match two detect_features() results. Returns matched point pairs
+    (Nx2 arrays, in ORIGINAL full-frame pixel coordinates) after Lowe's
+    ratio test."""
+    kp1, des1, off1 = feat1
+    kp2, des2, off2 = feat2
     if des1 is None or des2 is None or len(kp1) < 4 or len(kp2) < 4:
         return np.empty((0, 2)), np.empty((0, 2))
 
-    bf = cv2.BFMatcher(norm)
+    bf = cv2.BFMatcher(_matcher_norm())
     raw_matches = bf.knnMatch(des1, des2, k=2)
     good = [m for m, n in raw_matches if n is not None and m.distance < config.MATCH_RATIO * n.distance]
 
@@ -119,6 +135,14 @@ def detect_and_match(gray1, gray2):
         pts1 += np.array(off1)
         pts2 += np.array(off2)
     return pts1, pts2
+
+
+def detect_and_match(gray1, gray2):
+    """Returns matched point pairs (Nx2 arrays, in ORIGINAL full-frame pixel
+    coordinates) after Lowe's ratio test. Convenience wrapper around
+    detect_features() + match_features() for callers that don't need to
+    cache features across calls."""
+    return match_features(detect_features(gray1), detect_features(gray2))
 
 
 def estimate_similarity(pts1, pts2):
@@ -187,7 +211,15 @@ def process_pair(path1, path2, alt1, alt2):
 def process_pair_arrays(gray1, gray2, alt1, alt2):
     """Same as process_pair(), but on already-decoded grayscale arrays —
     used by the live capture loop, which never round-trips frames to disk."""
-    pts1, pts2 = detect_and_match(gray1, gray2)
+    return process_pair_features(detect_features(gray1), detect_features(gray2), alt1, alt2)
+
+
+def process_pair_features(feat1, feat2, alt1, alt2):
+    """Same as process_pair_arrays(), but takes precomputed detect_features()
+    results instead of raw grayscale arrays, so a caller stepping through a
+    video stream can cache the previous frame's features and reuse them as
+    frame 1 of the next pair instead of re-running detection on it twice."""
+    pts1, pts2 = match_features(feat1, feat2)
     M, inliers = estimate_similarity(pts1, pts2)
 
     n_matches = len(pts1)
