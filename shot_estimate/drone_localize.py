@@ -23,7 +23,9 @@ Usage:
 
 import argparse
 import bisect
+import json
 import logging
+import math
 import sys
 import threading
 import time
@@ -44,6 +46,8 @@ from config import (ZOOM_LEVEL, INDEX_DIR, TILE_DIR,
 TAKEOFF_ALT      = 50.0   # m  — begin capturing once above this
 MIN_CAPTURE_ALT  = 10.0   # m  — pause if drone descends below this (landing)
 CAPTURE_INTERVAL = 5.0    # s  — time between photos
+MAX_TILT_DEG     = 15.0   # deg — skip capture if |roll| or |pitch| exceeds this
+                           #       (tilt up to 15° is perspective-corrected before localization)
 
 # ── drift-prevention parameters ───────────────────────────────────────────────
 MIN_INLIERS_SEND     = 10     # below this RANSAC geometry is useless
@@ -73,32 +77,46 @@ class VehicleState:
     """Thread-safe container for the latest Pixhawk telemetry."""
 
     def __init__(self):
-        self._lock   = threading.Lock()
-        self.alt_m   = 0.0
-        self.lat     = None   # float degrees
-        self.lon     = None
-        self.gps_ok  = False
+        self._lock    = threading.Lock()
+        self.alt_m    = 0.0
+        self.lat      = None   # float degrees
+        self.lon      = None
+        self.gps_ok   = False
+        self.roll_deg  = 0.0
+        self.pitch_deg = 0.0
+        self.yaw_deg   = 0.0
 
-    def update(self, lat_1e7, lon_1e7, relative_alt_mm):
+    def update_position(self, lat_1e7, lon_1e7, relative_alt_mm):
         with self._lock:
             self.alt_m  = relative_alt_mm / 1000.0
             self.lat    = lat_1e7  / 1e7
             self.lon    = lon_1e7  / 1e7
             self.gps_ok = True
 
-    def snapshot(self):
-        """Return (alt_m, lat, lon, gps_ok) atomically."""
+    def update_attitude(self, roll_rad, pitch_rad, yaw_rad):
         with self._lock:
-            return self.alt_m, self.lat, self.lon, self.gps_ok
+            self.roll_deg  = math.degrees(roll_rad)
+            self.pitch_deg = math.degrees(pitch_rad)
+            self.yaw_deg   = math.degrees(yaw_rad)
+
+    def snapshot(self):
+        """Return (alt_m, lat, lon, gps_ok, roll_deg, pitch_deg, yaw_deg) atomically."""
+        with self._lock:
+            return (self.alt_m, self.lat, self.lon, self.gps_ok,
+                    self.roll_deg, self.pitch_deg, self.yaw_deg)
 
 
 def _mavlink_reader(conn, state: VehicleState, stop: threading.Event):
-    """Background thread: pump GLOBAL_POSITION_INT into VehicleState."""
+    """Background thread: pump GLOBAL_POSITION_INT and ATTITUDE into VehicleState."""
     log.info('MAVLink reader thread started.')
     while not stop.is_set():
-        msg = conn.recv_match(type='GLOBAL_POSITION_INT', blocking=True, timeout=1.0)
+        msg = conn.recv_match(type=['GLOBAL_POSITION_INT', 'ATTITUDE'],
+                              blocking=True, timeout=1.0)
         if msg:
-            state.update(msg.lat, msg.lon, msg.relative_alt)
+            if msg.get_type() == 'GLOBAL_POSITION_INT':
+                state.update_position(msg.lat, msg.lon, msg.relative_alt)
+            elif msg.get_type() == 'ATTITUDE':
+                state.update_attitude(msg.roll, msg.pitch, msg.yaw)
     log.info('MAVLink reader thread stopped.')
 
 
@@ -183,11 +201,32 @@ class SiftLocalizer:
             votes[ti].append(m)
         return sorted(votes.items(), key=lambda kv: len(kv[1]), reverse=True)
 
-    def localize(self, frame_bgr):
+    @staticmethod
+    def _build_correction_H(w, h, pitch_deg, roll_deg, yaw_deg, fov_h_deg=80.0):
+        f = w / (2.0 * math.tan(math.radians(fov_h_deg / 2.0)))
+        K  = np.array([[f, 0, w/2], [0, f, h/2], [0, 0, 1]], dtype=np.float64)
+        p, r, y = (-math.radians(pitch_deg), -math.radians(roll_deg),
+                   -math.radians(yaw_deg))
+        Rx = np.array([[1,0,0],[0,math.cos(p),-math.sin(p)],[0,math.sin(p),math.cos(p)]])
+        Ry = np.array([[math.cos(r),0,math.sin(r)],[0,1,0],[-math.sin(r),0,math.cos(r)]])
+        Rz = np.array([[math.cos(y),-math.sin(y),0],[math.sin(y),math.cos(y),0],[0,0,1]])
+        R  = Rx @ Ry @ Rz
+        return K @ R @ np.linalg.inv(K)
+
+    def localize(self, frame_bgr, pitch_deg=0.0, roll_deg=0.0, yaw_deg=0.0):
         """
         Run two-phase SIFT localization on frame_bgr.
-        Returns (lat, lon) on success, or None if no match found.
+        Applies perspective correction for pitch/roll/yaw before feature extraction.
+        Returns (lat, lon, inliers) on success, or None if no match found.
         """
+        h, w = frame_bgr.shape[:2]
+        if abs(pitch_deg) > 0.5 or abs(roll_deg) > 0.5 or abs(yaw_deg) > 0.5:
+            H = self._build_correction_H(w, h, pitch_deg, roll_deg, yaw_deg)
+            frame_bgr = cv2.warpPerspective(frame_bgr, H, (w, h),
+                                            flags=cv2.INTER_LINEAR,
+                                            borderMode=cv2.BORDER_REPLICATE)
+            log.info(f'  Tilt correction: pitch={pitch_deg:.1f}°'
+                     f' roll={roll_deg:.1f}° yaw={yaw_deg:.1f}°')
         gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
         sift = cv2.SIFT_create(nfeatures=2000)
         kps_q, descs_q = sift.detectAndCompute(gray, None)
@@ -429,7 +468,7 @@ def main():
 
     try:
         while True:
-            alt, lat, lon, gps_ok = state.snapshot()
+            alt, lat, lon, gps_ok, roll_deg, pitch_deg, yaw_deg = state.snapshot()
 
             # ── takeoff detection ─────────────────────────────────────────────
             if was_on_ground and alt >= TAKEOFF_ALT:
@@ -452,12 +491,21 @@ def main():
                 last_capture_t = now
                 log.info(f'=== Capture triggered  alt={alt:.1f} m ===')
 
-                # Obtain real GPS from Pixhawk right before the shot
-                _, real_lat, real_lon, gps_ok = state.snapshot()
+                # Obtain real GPS + attitude from Pixhawk right before the shot
+                _, real_lat, real_lon, gps_ok, roll_deg, pitch_deg, yaw_deg = state.snapshot()
                 if not gps_ok or real_lat is None:
                     log.warning('  Pixhawk GPS not ready — skipping capture.')
                     continue
                 log.info(f'  Real GPS : {real_lat:.7f}, {real_lon:.7f}')
+                log.info(f'  Attitude : roll={roll_deg:.1f}°'
+                         f' pitch={pitch_deg:.1f}° yaw={yaw_deg:.1f}°')
+
+                # Attitude guard — skip if tilt is too extreme to correct
+                if abs(roll_deg) > MAX_TILT_DEG or abs(pitch_deg) > MAX_TILT_DEG:
+                    log.warning(f'  [TILTED — skip] roll={roll_deg:.1f}°'
+                                f' pitch={pitch_deg:.1f}° > MAX_TILT_DEG={MAX_TILT_DEG}°')
+                    last_capture_t -= CAPTURE_INTERVAL * 0.8  # retry sooner
+                    continue
 
                 # Capture frame from CSI camera
                 try:
@@ -466,8 +514,8 @@ def main():
                     log.error(f'  Camera error: {exc}')
                     continue
 
-                # Estimate location via SIFT tile matching
-                est = localizer.localize(frame)
+                # Estimate location via SIFT tile matching (with tilt correction)
+                est = localizer.localize(frame, pitch_deg, roll_deg, yaw_deg)
                 if est is not None:
                     est_lat, est_lon, inliers = est
                     dist_m = _haversine_m(real_lat, real_lon, est_lat, est_lon)
@@ -494,6 +542,17 @@ def main():
                 outpath = PHOTO_DIR / fname
                 cv2.imwrite(str(outpath), frame)
                 log.info(f'  Saved    : {fname}')
+
+                # Save companion attitude JSON for post-processing / correct_tilt.py
+                jpath = outpath.with_suffix('.attitude.json')
+                with open(jpath, 'w') as jf:
+                    json.dump({'roll_deg': round(roll_deg, 4),
+                               'pitch_deg': round(pitch_deg, 4),
+                               'yaw_deg': round(yaw_deg, 4),
+                               'alt_m': round(alt, 1),
+                               'lat': round(real_lat, 7),
+                               'lon': round(real_lon, 7)}, jf, indent=2)
+                log.info(f'  Attitude : {jpath.name}')
 
             time.sleep(0.1)
 

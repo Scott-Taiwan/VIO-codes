@@ -67,7 +67,9 @@ static const double TAKEOFF_ALT       = 30.0;   // m  — start capturing above 
 static const double MIN_CAPTURE_ALT   = 10.0;   // m  — pause below this (landing)
 // interval is now a CLI parameter (--interval), default 5 s
 
-static const float  MAX_TILT_DEG      = 5.0f;   // skip capture if roll or pitch exceeds this
+static const float  MAX_TILT_DEG      = 15.0f;  // skip capture if roll or pitch exceeds this
+                                                 // (pitch/roll up to 15° is corrected by
+                                                 //  build_correction_H before localization)
 
 // ── drift-prevention parameters ───────────────────────────────────────────────
 static const int    MIN_INLIERS_SEND      = 10;    // below this RANSAC geometry is useless
@@ -763,16 +765,62 @@ static std::string build_filename(double real_lat, double real_lon,
     return ss.str();
 }
 
+// ── perspective correction helper ────────────────────────────────────────────
+
+static cv::Mat build_correction_H(cv::Size img_size,
+                                   float pitch_deg, float roll_deg, float yaw_deg,
+                                   float fov_h_deg = 80.0f)
+{
+    double f = img_size.width / (2.0 * std::tan(fov_h_deg * M_PI / 360.0));
+    cv::Mat K = (cv::Mat_<double>(3,3) << f, 0, img_size.width  / 2.0,
+                                          0, f, img_size.height / 2.0,
+                                          0, 0, 1);
+    double p = -pitch_deg * M_PI / 180.0;
+    double r = -roll_deg  * M_PI / 180.0;
+    double y = -yaw_deg   * M_PI / 180.0;
+    cv::Mat Rx = (cv::Mat_<double>(3,3) <<
+        1, 0,            0,
+        0, std::cos(p), -std::sin(p),
+        0, std::sin(p),  std::cos(p));
+    cv::Mat Ry = (cv::Mat_<double>(3,3) <<
+        std::cos(r),  0, std::sin(r),
+        0,            1, 0,
+        -std::sin(r), 0, std::cos(r));
+    cv::Mat Rz = (cv::Mat_<double>(3,3) <<
+        std::cos(y), -std::sin(y), 0,
+        std::sin(y),  std::cos(y), 0,
+        0,            0,           1);
+    cv::Mat R = Rx * Ry * Rz;
+    return K * R * K.inv();
+}
+
 // ── localize one frame ────────────────────────────────────────────────────────
 
 static std::optional<MatchResult> localize_frame(
     const cv::Mat& frame,
     const std::vector<TileEntry>& index,
     const FlannIndex& fi,
-    int zoom)
+    int zoom,
+    float pitch_deg = 0.0f,
+    float roll_deg  = 0.0f,
+    float yaw_deg   = 0.0f)
 {
+    // Apply perspective correction for pitch / roll / yaw before feature extraction
+    cv::Mat corrected;
+    if (std::fabs(pitch_deg) > 0.5f || std::fabs(roll_deg) > 0.5f || std::fabs(yaw_deg) > 0.5f) {
+        cv::Mat H = build_correction_H(frame.size(), pitch_deg, roll_deg, yaw_deg);
+        cv::warpPerspective(frame, corrected, H, frame.size(),
+                            cv::INTER_LINEAR, cv::BORDER_REPLICATE);
+        g_log << ts() << "  Tilt correction applied"
+              << " pitch=" << std::setprecision(1) << pitch_deg
+              << "° roll="  << roll_deg
+              << "° yaw="   << yaw_deg << "°\n";
+    } else {
+        corrected = frame;
+    }
+
     cv::Mat gray;
-    cv::cvtColor(frame, gray, cv::COLOR_BGR2GRAY);
+    cv::cvtColor(corrected, gray, cv::COLOR_BGR2GRAY);
 
     // Phase 1 — coarse FLANN vote (CPU SIFT to match pre-built index)
     auto sift = cv::SIFT::create(2000);
@@ -1065,9 +1113,10 @@ int main(int argc, char* argv[])
             }
             g_log << ts() << "  Frame: " << frame.cols << "x" << frame.rows << "\n";
 
-            // SIFT localization
+            // SIFT localization (attitude-corrected)
             g_log << ts() << "  Starting SIFT localization …\n";
-            auto result = localize_frame(frame, index, fi, zoom);
+            auto result = localize_frame(frame, index, fi, zoom,
+                                         pitch_deg, roll_deg, yaw_deg);
 
             bool has_fix = result.has_value();
             double est_lat = 0, est_lon = 0, dist_m = -1.0;
