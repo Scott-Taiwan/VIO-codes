@@ -67,6 +67,8 @@ static const double TAKEOFF_ALT       = 30.0;   // m  — start capturing above 
 static const double MIN_CAPTURE_ALT   = 10.0;   // m  — pause below this (landing)
 // interval is now a CLI parameter (--interval), default 5 s
 
+static const float  MAX_TILT_DEG      = 5.0f;   // skip capture if roll or pitch exceeds this
+
 // ── drift-prevention parameters ───────────────────────────────────────────────
 static const int    MIN_INLIERS_SEND      = 10;    // below this RANSAC geometry is useless
 static const double MIN_WAYPOINT_SPACING  = 300.0; // m — warn if waypoints closer (#4)
@@ -275,6 +277,17 @@ static void request_streams(int fd)
     uint16_t len = mavlink_msg_to_send_buffer(buf, &msg);
     ::write(fd, buf, len);
     std::cout << "[stream] Requested POSITION stream at 4 Hz.\n";
+
+    // Also request ATTITUDE stream so we can guard against oblique photos
+    mavlink_msg_request_data_stream_pack(
+        1, 200, &msg,
+        1, 1,
+        MAV_DATA_STREAM_EXTRA1,    // ATTITUDE
+        10,                        // 10 Hz — attitude changes fast
+        1);
+    len = mavlink_msg_to_send_buffer(buf, &msg);
+    ::write(fd, buf, len);
+    std::cout << "[stream] Requested ATTITUDE stream at 10 Hz.\n";
 }
 
 // Block until one HEARTBEAT is received from Pixhawk.
@@ -616,10 +629,13 @@ static std::optional<MatchResult> direct_match(
 
 struct VehicleState {
     std::mutex mtx;
-    double  alt_m  = 0.0;
-    double  lat    = 0.0;
-    double  lon    = 0.0;
-    bool    gps_ok = false;
+    double  alt_m    = 0.0;
+    double  lat      = 0.0;
+    double  lon      = 0.0;
+    bool    gps_ok   = false;
+    float   roll_rad  = 0.0f;
+    float   pitch_rad = 0.0f;
+    float   yaw_rad   = 0.0f;
 
     void update(int32_t lat_1e7, int32_t lon_1e7, int32_t rel_alt_mm) {
         std::lock_guard<std::mutex> lk(mtx);
@@ -629,10 +645,17 @@ struct VehicleState {
         gps_ok = true;
     }
 
-    struct Snap { double alt_m, lat, lon; bool gps_ok; };
+    void update_attitude(float roll, float pitch, float yaw) {
+        std::lock_guard<std::mutex> lk(mtx);
+        roll_rad  = roll;
+        pitch_rad = pitch;
+        yaw_rad   = yaw;
+    }
+
+    struct Snap { double alt_m, lat, lon; bool gps_ok; float roll_rad, pitch_rad, yaw_rad; };
     Snap snapshot() {
         std::lock_guard<std::mutex> lk(mtx);
-        return {alt_m, lat, lon, gps_ok};
+        return {alt_m, lat, lon, gps_ok, roll_rad, pitch_rad, yaw_rad};
     }
 };
 
@@ -691,6 +714,10 @@ static void mavlink_reader(int fd, VehicleState& state)
                 mavlink_global_position_int_t pos;
                 mavlink_msg_global_position_int_decode(&msg, &pos);
                 state.update(pos.lat, pos.lon, pos.relative_alt);
+            } else if (msg.msgid == MAVLINK_MSG_ID_ATTITUDE) {
+                mavlink_attitude_t att;
+                mavlink_msg_attitude_decode(&msg, &att);
+                state.update_attitude(att.roll, att.pitch, att.yaw);
             }
         }
     }
@@ -710,7 +737,7 @@ static std::string gst_pipeline(int sensor_id, int w, int h, int fps, int flip)
        << "video/x-raw, width=(int)" << w << ", height=(int)" << h
        << ", format=(string)BGRx ! "
        << "videoconvert ! "
-       << "video/x-raw, format=(string)BGR ! appsink";
+       << "video/x-raw, format=(string)BGR ! appsink sync=false max-buffers=1 drop=true";
     return ss.str();
 }
 
@@ -974,7 +1001,7 @@ int main(int argc, char* argv[])
     std::cout << "Waiting for takeoff (altitude ≥ " << TAKEOFF_ALT << " m) …\n";
 
     while (!g_shutdown) {
-        auto [alt, lat, lon, gps_ok] = state.snapshot();
+        auto [alt, lat, lon, gps_ok, roll_unused, pitch_unused] = state.snapshot();
 
         // takeoff detection
         if (was_on_ground && alt >= TAKEOFF_ALT) {
@@ -1006,13 +1033,26 @@ int main(int argc, char* argv[])
             last_capture = now;
             g_log << "\n" << ts() << std::string(50, '-') << "\n";
 
-            // fresh GPS snapshot right before the shot
-            auto [snap_alt, real_lat, real_lon, snap_ok] = state.snapshot();
+            // fresh GPS + attitude snapshot right before the shot
+            auto [snap_alt, real_lat, real_lon, snap_ok, roll_r, pitch_r, yaw_r] = state.snapshot();
             g_log << ts() << "Capture — alt=" << std::fixed << std::setprecision(1)
                   << snap_alt << " m  GPS=" << std::setprecision(7)
                   << real_lat << "," << real_lon;
             if (!snap_ok) {
                 g_log << "  [NO GPS FIX — skip]\n";
+                continue;
+            }
+
+            // Attitude guard — skip oblique photos (matching only works nadir)
+            float roll_deg  = roll_r  * 57.2958f;
+            float pitch_deg = pitch_r * 57.2958f;
+            float yaw_deg   = yaw_r   * 57.2958f;
+            g_log << "  roll=" << std::setprecision(1) << roll_deg
+                  << "° pitch=" << pitch_deg << "°";
+            if (std::fabs(roll_deg) > MAX_TILT_DEG || std::fabs(pitch_deg) > MAX_TILT_DEG) {
+                g_log << "  [TILTED — skip]\n";
+                last_capture -= std::chrono::milliseconds(
+                    static_cast<int>(interval * 800));  // retry sooner (80% of interval)
                 continue;
             }
             g_log << "\n";
@@ -1050,6 +1090,22 @@ int main(int argc, char* argv[])
             std::string fpath = std::string(PHOTO_DIR) + "/" + fname;
             cv::imwrite(fpath, frame);
             g_log << ts() << "  Saved: " << fpath << "\n";
+
+            // companion attitude JSON — used by correct_tilt.py for perspective correction
+            {
+                std::string jpath = fpath.substr(0, fpath.rfind('.')) + ".attitude.json";
+                std::ofstream jf(jpath);
+                jf << std::fixed;
+                jf << "{\n"
+                   << "  \"roll_deg\":  " << std::setprecision(4) << roll_deg  << ",\n"
+                   << "  \"pitch_deg\": " << std::setprecision(4) << pitch_deg << ",\n"
+                   << "  \"yaw_deg\":   " << std::setprecision(4) << yaw_deg   << ",\n"
+                   << "  \"alt_m\":     " << std::setprecision(1) << snap_alt  << ",\n"
+                   << "  \"lat\":       " << std::setprecision(7) << real_lat  << ",\n"
+                   << "  \"lon\":       " << std::setprecision(7) << real_lon  << "\n"
+                   << "}\n";
+                g_log << ts() << "  Attitude JSON: " << jpath << "\n";
+            }
         }
 
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
